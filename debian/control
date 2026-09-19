@@ -1,0 +1,21 @@
+Source: microtun-firmware-signer
+Section: admin
+Priority: optional
+Maintainer: Local Package Builder <root@localhost>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: microtun-firmware-signer
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ adduser
+Description: Microtun firmware signing service
+ HTTP service for signing Microtun firmware digests with a configured Ed25519
+ signing key. It supports GitHub OAuth identities and GitHub Actions OIDC identities
+ with an explicit authorization policy.

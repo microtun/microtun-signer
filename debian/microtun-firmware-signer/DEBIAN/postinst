@@ -1,0 +1,53 @@
+#!/bin/sh
+set -e
+
+SERVICE_USER="microtun-firmware-signer"
+SERVICE_GROUP="microtun-firmware-signer"
+CONFIG_DIR="/etc/microtun-firmware-signer"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
+
+if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+    addgroup --system "$SERVICE_GROUP"
+fi
+
+if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+    adduser \
+        --system \
+        --ingroup "$SERVICE_GROUP" \
+        --home /nonexistent \
+        --no-create-home \
+        --disabled-login \
+        --gecos "Microtun firmware signer" \
+        "$SERVICE_USER"
+fi
+
+if [ -d "$CONFIG_DIR" ]; then
+    chown root:"$SERVICE_GROUP" "$CONFIG_DIR"
+    chmod 0750 "$CONFIG_DIR"
+fi
+
+if [ -f "$CONFIG_FILE" ]; then
+    chown root:"$SERVICE_GROUP" "$CONFIG_FILE"
+    chmod 0640 "$CONFIG_FILE"
+fi
+
+# Automatically added by dh_installsystemd/13.24.2
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+	if deb-systemd-helper debian-installed 'microtun-firmware-signer.service'; then
+		# The following line should be removed in trixie or trixie+1
+		deb-systemd-helper unmask 'microtun-firmware-signer.service' >/dev/null || true
+
+		if deb-systemd-helper --quiet was-enabled 'microtun-firmware-signer.service'; then
+			# Create new symlinks, if any.
+			deb-systemd-helper enable 'microtun-firmware-signer.service' >/dev/null || true
+		fi
+	fi
+
+	# Update the statefile to add new symlinks (if any), which need to be cleaned
+	# up on purge. Also remove old symlinks.
+	deb-systemd-helper update-state 'microtun-firmware-signer.service' >/dev/null || true
+fi
+# End automatically added section
+
+
+exit 0

@@ -1,0 +1,32 @@
+#!/usr/bin/make -f
+
+export CARGO_TERM_COLOR := never
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	# Cleaning must not require a working Cargo/rustup toolchain.
+	rm -rf target
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --release --locked
+endif
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/microtun-firmware-signer \
+		debian/microtun-firmware-signer/usr/bin/microtun-firmware-signer
+	install -D -m 0640 config.example.toml \
+		debian/microtun-firmware-signer/etc/microtun-firmware-signer/config.toml
+	install -D -m 0644 deploy/microtun-firmware-signer.service \
+		debian/microtun-firmware-signer/usr/lib/systemd/system/microtun-firmware-signer.service
+
+override_dh_installsystemd:
+	# The example configuration is intentionally not runnable as-is. Do not
+	# enable or start the service until the administrator has supplied the
+	# signing key, credentials, OAuth settings, and authorization policy.
+	dh_installsystemd --no-enable --no-start

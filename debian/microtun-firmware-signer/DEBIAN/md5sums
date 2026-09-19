@@ -1,0 +1,5 @@
+34b2a105d181f0d9ce01cf7df4bbb060  usr/bin/microtun-firmware-signer
+f37be063334b9252fd9c2a4dc9874e2f  usr/lib/systemd/system/microtun-firmware-signer.service
+fcc3602d87e5973fc9a9b48b2aff8159  usr/share/doc/microtun-firmware-signer/README.Debian
+3ca5829a71d86bf2c797a40f79ed1e2b  usr/share/doc/microtun-firmware-signer/README.md
+58c6224cbfabfde6fe0576a78a66f1be  usr/share/doc/microtun-firmware-signer/changelog.gz

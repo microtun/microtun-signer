@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_VERSION=1.88.0
+ARG DEBIAN_SUITE=bookworm
+
+FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS deb-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# cargo/rustc from Debian satisfy debian/control's Build-Depends. The Rust
+# toolchain from the official rust image is earlier on PATH and is the one that
+# actually builds the project, so the repository's Rust 1.88 MSRV is honored.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cargo \
+        debhelper \
+        dpkg-dev \
+        rustc
+
+WORKDIR /build/src
+COPY . .
+
+# dpkg-buildpackage writes binary packages to the parent of the source tree,
+# i.e. /build/*.deb. BuildKit caches Cargo downloads between builds without
+# putting them into the final artifact image. The project target directory is
+# deliberately not a cache mount because Debian's clean phase removes it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    dpkg-buildpackage -us -uc -b
+
+FROM scratch AS debs
+COPY --from=deb-builder /build/*.deb /target/
