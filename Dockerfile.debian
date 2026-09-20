@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.88.0
-ARG DEBIAN_SUITE=bookworm
+ARG RUST_VERSION=1.98.1
+ARG DEBIAN_SUITE=trixie
 
 FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS deb-builder
 
@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # cargo/rustc from Debian satisfy debian/control's Build-Depends. The Rust
 # toolchain from the official rust image is earlier on PATH and is the one that
-# actually builds the project, so the repository's Rust 1.88 MSRV is honored.
+# actually builds the project.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \

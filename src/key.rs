@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, path::Path, sync::RwLock};
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{
@@ -10,9 +10,6 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::config::{KeyConfig, KeyState};
-
-pub const KEY_PASSPHRASE_ENV: &str = "MICROTUN_SIGNER_KEY_PASSPHRASE";
-pub const KEY_PASSPHRASE_FILE_ENV: &str = "MICROTUN_SIGNER_KEY_PASSPHRASE_FILE";
 
 pub struct KeyRing {
     keys: HashMap<String, KeyMaterial>,
@@ -50,9 +47,30 @@ impl KeyRing {
 pub struct KeyMaterial {
     id: String,
     state: KeyState,
+    encrypted_pem: Zeroizing<String>,
+    unlocked: RwLock<Option<UnlockedKeyMaterial>>,
+}
+
+struct UnlockedKeyMaterial {
     signing_key: SigningKey,
     public_key_pem: String,
     fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockOutcome {
+    Unlocked,
+    AlreadyUnlocked,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnlockError {
+    #[error("signing key is not active")]
+    Inactive,
+    #[error("signing key passphrase is invalid or the encrypted key cannot be decrypted")]
+    InvalidPassphrase,
+    #[error("signing key lock is poisoned")]
+    LockPoisoned,
 }
 
 impl KeyMaterial {
@@ -70,19 +88,15 @@ impl KeyMaterial {
             );
         }
 
-        let passphrase = load_required_secret(
-            KEY_PASSPHRASE_ENV,
-            KEY_PASSPHRASE_FILE_ENV,
-            &config.passphrase_credential,
-            &format!("firmware signing key {} passphrase", config.id),
-        )?;
-        let signing_key = SigningKey::from_pkcs8_encrypted_pem(&pem, passphrase.as_bytes())
-            .context("failed to decrypt/parse Ed25519 PKCS#8 private key")?;
-
-        Self::from_signing_key(config.id.clone(), config.state, signing_key)
+        Ok(Self {
+            id: config.id.clone(),
+            state: config.state,
+            encrypted_pem: Zeroizing::new(pem),
+            unlocked: RwLock::new(None),
+        })
     }
 
-    fn from_signing_key(id: String, state: KeyState, signing_key: SigningKey) -> Result<Self> {
+    fn unlocked_from_signing_key(signing_key: SigningKey) -> Result<UnlockedKeyMaterial> {
         let verifying_key = signing_key.verifying_key();
         let public_der = verifying_key
             .to_public_key_der()
@@ -98,9 +112,7 @@ impl KeyMaterial {
             hex::encode(Sha256::digest(public_der.as_bytes()))
         );
 
-        Ok(Self {
-            id,
-            state,
+        Ok(UnlockedKeyMaterial {
             signing_key,
             public_key_pem,
             fingerprint,
@@ -115,17 +127,66 @@ impl KeyMaterial {
         self.state
     }
 
-    pub fn public_key_pem(&self) -> &str {
-        &self.public_key_pem
+    pub fn is_unlocked(&self) -> bool {
+        self.unlocked
+            .read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 
-    pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+    pub fn public_key_pem(&self) -> Option<String> {
+        self.unlocked
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|key| key.public_key_pem.clone()))
     }
 
-    pub fn sign_digest(&self, digest: &[u8; 32]) -> [u8; 64] {
-        let signature: Signature = self.signing_key.sign(digest);
-        signature.to_bytes()
+    pub fn fingerprint(&self) -> Option<String> {
+        self.unlocked
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|key| key.fingerprint.clone()))
+    }
+
+    pub fn unlock(&self, passphrase: &str) -> Result<UnlockOutcome, UnlockError> {
+        if self.state != KeyState::Active {
+            return Err(UnlockError::Inactive);
+        }
+
+        {
+            let guard = self
+                .unlocked
+                .read()
+                .map_err(|_| UnlockError::LockPoisoned)?;
+            if guard.is_some() {
+                return Ok(UnlockOutcome::AlreadyUnlocked);
+            }
+        }
+
+        let signing_key = SigningKey::from_pkcs8_encrypted_pem(
+            self.encrypted_pem.as_str(),
+            passphrase.as_bytes(),
+        )
+        .map_err(|_| UnlockError::InvalidPassphrase)?;
+        let unlocked = Self::unlocked_from_signing_key(signing_key)
+            .map_err(|_| UnlockError::InvalidPassphrase)?;
+
+        let mut guard = self
+            .unlocked
+            .write()
+            .map_err(|_| UnlockError::LockPoisoned)?;
+        if guard.is_some() {
+            return Ok(UnlockOutcome::AlreadyUnlocked);
+        }
+        *guard = Some(unlocked);
+        Ok(UnlockOutcome::Unlocked)
+    }
+
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Option<[u8; 64]> {
+        let guard = self.unlocked.read().ok()?;
+        let key = guard.as_ref()?;
+        let signature: Signature = key.signing_key.sign(digest);
+        Some(signature.to_bytes())
     }
 }
 
@@ -235,38 +296,77 @@ mod tests {
 
     use super::*;
 
+    fn test_key(id: &str, state: KeyState) -> KeyMaterial {
+        KeyMaterial {
+            id: id.into(),
+            state,
+            encrypted_pem: Zeroizing::new(
+                include_str!("../tests/fixtures/test-ed25519-encrypted.pem").to_owned(),
+            ),
+            unlocked: RwLock::new(None),
+        }
+    }
+
     #[test]
-    fn encrypted_test_key_decrypts_and_signs_exact_digest() {
-        let pem = include_str!("../tests/fixtures/test-ed25519-encrypted.pem");
-        let signing_key = SigningKey::from_pkcs8_encrypted_pem(pem, b"test-passphrase").unwrap();
-        let key = KeyMaterial::from_signing_key("test-key".into(), KeyState::Active, signing_key)
-            .unwrap();
+    fn encrypted_test_key_starts_locked_then_unlocks_and_signs_exact_digest() {
+        let key = test_key("test-key", KeyState::Active);
+        assert!(!key.is_unlocked());
+        assert!(key.fingerprint().is_none());
+        assert!(key.public_key_pem().is_none());
+        assert!(key.sign_digest(&[0x5a; 32]).is_none());
+
+        assert_eq!(
+            key.unlock("test-passphrase").unwrap(),
+            UnlockOutcome::Unlocked
+        );
+        assert!(key.is_unlocked());
+        assert_eq!(
+            key.unlock("not-used-after-unlock").unwrap(),
+            UnlockOutcome::AlreadyUnlocked
+        );
+
         let digest = [0x5a; 32];
-        let signature = Signature::from_bytes(&key.sign_digest(&digest));
-        let verifying_key = VerifyingKey::from(&key.signing_key);
+        let signature = Signature::from_bytes(&key.sign_digest(&digest).unwrap());
+        let signing_key = SigningKey::from_pkcs8_encrypted_pem(
+            include_str!("../tests/fixtures/test-ed25519-encrypted.pem"),
+            b"test-passphrase",
+        )
+        .unwrap();
+        let verifying_key = VerifyingKey::from(&signing_key);
         verifying_key.verify(&digest, &signature).unwrap();
-        assert!(key.fingerprint().starts_with("sha256:"));
+        assert!(key.fingerprint().unwrap().starts_with("sha256:"));
         assert!(
             key.public_key_pem()
+                .unwrap()
                 .starts_with("-----BEGIN PUBLIC KEY-----\n")
         );
     }
 
     #[test]
+    fn wrong_passphrase_does_not_unlock_key() {
+        let key = test_key("test-key", KeyState::Active);
+        assert!(matches!(
+            key.unlock("wrong"),
+            Err(UnlockError::InvalidPassphrase)
+        ));
+        assert!(!key.is_unlocked());
+    }
+
+    #[test]
+    fn inactive_keys_cannot_be_unlocked() {
+        let key = test_key("retired-key", KeyState::Retired);
+        assert!(matches!(
+            key.unlock("test-passphrase"),
+            Err(UnlockError::Inactive)
+        ));
+    }
+
+    #[test]
     fn key_ring_selects_keys_by_immutable_id() {
-        let pem = include_str!("../tests/fixtures/test-ed25519-encrypted.pem");
-        let a = SigningKey::from_pkcs8_encrypted_pem(pem, b"test-passphrase").unwrap();
-        let b = SigningKey::from_pkcs8_encrypted_pem(pem, b"test-passphrase").unwrap();
         let ring = KeyRing {
             keys: HashMap::from([
-                (
-                    "key-a".to_owned(),
-                    KeyMaterial::from_signing_key("key-a".into(), KeyState::Active, a).unwrap(),
-                ),
-                (
-                    "key-b".to_owned(),
-                    KeyMaterial::from_signing_key("key-b".into(), KeyState::Retired, b).unwrap(),
-                ),
+                ("key-a".to_owned(), test_key("key-a", KeyState::Active)),
+                ("key-b".to_owned(), test_key("key-b", KeyState::Retired)),
             ]),
         };
 

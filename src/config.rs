@@ -24,6 +24,8 @@ pub struct Config {
     pub microtun: MicrotunConfig,
     #[serde(rename = "Server")]
     pub server: ServerConfig,
+    #[serde(rename = "Unlock", default)]
+    pub unlock: UnlockConfig,
     #[serde(rename = "Key")]
     pub keys: Vec<KeyConfig>,
     #[serde(rename = "GitHub")]
@@ -50,8 +52,24 @@ pub struct MicrotunConfig {
 pub struct ServerConfig {
     #[serde(rename = "Listen")]
     pub listen: SocketAddr,
-    #[serde(rename = "BasePath", default = "default_base_path")]
-    pub base_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnlockConfig {
+    #[serde(rename = "SocketPath", default = "default_unlock_socket_path")]
+    pub socket_path: PathBuf,
+    #[serde(rename = "SocketMode", default = "default_unlock_socket_mode")]
+    pub socket_mode: u32,
+}
+
+impl Default for UnlockConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_unlock_socket_path(),
+            socket_mode: default_unlock_socket_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,25 +81,20 @@ pub struct KeyConfig {
     pub pem_path: PathBuf,
     #[serde(rename = "State", default)]
     pub state: KeyState,
-    #[serde(
-        rename = "PassphraseCredential",
-        default = "default_passphrase_credential"
-    )]
-    pub passphrase_credential: String,
+    // Accepted only to produce an explicit migration error. Key passphrases
+    // are no longer loaded from environment/files/systemd credentials.
+    #[serde(rename = "PassphraseCredential", default)]
+    pub passphrase_credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum KeyState {
+    #[default]
     Active,
     Disabled,
     Retired,
-}
-
-impl Default for KeyState {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl KeyState {
@@ -244,7 +257,17 @@ impl Config {
             );
         }
 
-        self.server.base_path = normalize_base_path(&self.server.base_path)?;
+        if !self.unlock.socket_path.is_absolute() {
+            bail!("Unlock.SocketPath must be an absolute path");
+        }
+        if self.unlock.socket_mode > 0o777
+            || self.unlock.socket_mode & 0o600 != 0o600
+            || self.unlock.socket_mode & 0o007 != 0
+        {
+            bail!(
+                "Unlock.SocketMode must grant owner read/write, must not grant access to other users, and must fit within 0777"
+            );
+        }
 
         if self.keys.is_empty() {
             bail!("at least one [[Key]] must be configured");
@@ -257,8 +280,10 @@ impl Config {
             if !key_ids.insert(key.id.as_str()) {
                 bail!("duplicate Key.ID {}", key.id);
             }
-            if !valid_credential_name(&key.passphrase_credential) {
-                bail!("Key.PassphraseCredential must match [A-Za-z0-9._-]{{1,128}}");
+            if key.passphrase_credential.is_some() {
+                bail!(
+                    "Key.PassphraseCredential is no longer supported; signing keys start locked and must be unlocked through the local unlock API"
+                );
             }
         }
 
@@ -284,16 +309,8 @@ impl Config {
         if callback.query().is_some() || callback.fragment().is_some() {
             bail!("GitHub.OAuthCallbackURL must not contain a query string or fragment");
         }
-        let expected_callback_path = format!("{}/v1/auth/github/callback", self.server.base_path);
-        if callback.path() != expected_callback_path {
-            bail!(
-                "GitHub.OAuthCallbackURL path must be {expected_callback_path} for Server.BasePath {}",
-                if self.server.base_path.is_empty() {
-                    "/"
-                } else {
-                    self.server.base_path.as_str()
-                }
-            );
+        if callback.path() != "/v1/auth/github/callback" {
+            bail!("GitHub.OAuthCallbackURL path must be /v1/auth/github/callback");
         }
         if self.github.oauth_session_ttl_seconds == 0
             || self.github.oauth_session_ttl_seconds > 24 * 60 * 60
@@ -543,25 +560,12 @@ fn valid_credential_name(value: &str) -> bool {
     valid_key_id(value)
 }
 
-fn normalize_base_path(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "/" {
-        return Ok(String::new());
-    }
-    if !trimmed.starts_with('/') || trimmed.ends_with('/') || trimmed.contains("//") {
-        bail!(
-            "Server.BasePath must be empty or a normalized absolute path without a trailing slash"
-        );
-    }
-    Ok(trimmed.to_owned())
+fn default_unlock_socket_path() -> PathBuf {
+    PathBuf::from("/run/microtun-firmware-signer/unlock.sock")
 }
 
-fn default_base_path() -> String {
-    "/microtun".to_owned()
-}
-
-fn default_passphrase_credential() -> String {
-    "signing-key-passphrase".to_owned()
+const fn default_unlock_socket_mode() -> u32 {
+    0o660
 }
 
 fn default_github_api_url() -> String {
@@ -623,13 +627,36 @@ PEMPath = "/tmp/test-key.pem"
 
 [GitHub]
 OAuthClientID = "Iv1.test-client-id"
-OAuthCallbackURL = "https://signer.example/microtun/v1/auth/github/callback"
+OAuthCallbackURL = "https://signer.example/v1/auth/github/callback"
 
 [GitHubActions]
 
 {extra}
 "#
         )
+    }
+
+    #[test]
+    fn oauth_callback_must_use_root_api_path() {
+        let text = base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#,
+        )
+        .replace(
+            "https://signer.example/v1/auth/github/callback",
+            "https://signer.example/legacy-prefix/v1/auth/github/callback",
+        );
+        let mut config: Config = toml::from_str(&text).unwrap();
+        let error = config.normalize_and_validate().unwrap_err().to_string();
+        assert!(error.contains("must be /v1/auth/github/callback"));
     }
 
     #[test]
@@ -641,11 +668,49 @@ OAuthCallbackURL = "https://signer.example/microtun/v1/auth/github/callback"
     }
 
     #[test]
-    fn base_path_is_normalized() {
-        assert_eq!(normalize_base_path("/").unwrap(), "");
-        assert_eq!(normalize_base_path("/microtun").unwrap(), "/microtun");
-        assert!(normalize_base_path("microtun").is_err());
-        assert!(normalize_base_path("/microtun/").is_err());
+    fn unlock_socket_defaults_to_local_runtime_path() {
+        let text = base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#,
+        );
+        let mut config: Config = toml::from_str(&text).unwrap();
+        config.normalize_and_validate().unwrap();
+        assert_eq!(
+            config.unlock.socket_path,
+            PathBuf::from("/run/microtun-firmware-signer/unlock.sock")
+        );
+        assert_eq!(config.unlock.socket_mode, 0o660);
+    }
+
+    #[test]
+    fn key_passphrase_credential_is_rejected() {
+        let text = base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#,
+        )
+        .replace(
+            "PEMPath = \"/tmp/test-key.pem\"",
+            "PEMPath = \"/tmp/test-key.pem\"\nPassphraseCredential = \"signing-key-passphrase\"",
+        );
+        let mut config: Config = toml::from_str(&text).unwrap();
+        let error = config.normalize_and_validate().unwrap_err().to_string();
+        assert!(error.contains("no longer supported"));
     }
 
     #[test]

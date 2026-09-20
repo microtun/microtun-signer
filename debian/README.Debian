@@ -14,18 +14,36 @@ secure ownership/mode is:
 The application also enforces that encrypted key files are not group-writable
 and are not accessible by other users.
 
-The packaged systemd unit contains example LoadCredentialEncrypted= directives
-for the single signing-key passphrase and GitHub OAuth secret; their credential
-names match the example configuration. Deployment-specific
-credential mappings should normally be placed in a systemd drop-in instead of
-editing the packaged unit, for example:
+Signing-key passphrases are intentionally not systemd credentials. Every active
+key starts locked after service startup. The packaged unit creates
+/run/microtun-firmware-signer and the service exposes its unlock management API
+at /run/microtun-firmware-signer/unlock.sock. The socket defaults to mode 0660.
+Operators who need to unlock keys should be granted access to the service group,
+or invoke the unlock subcommand as an appropriately privileged user:
+
+  microtun-firmware-signer unlock --key microtun-firmware-prod
+
+The unlock subcommand reads the passphrase directly from the terminal with hidden
+input in Rust and never accepts the key passphrase as a command-line argument or
+environment variable.
+
+The GitHub OAuth client secret remains a systemd encrypted credential. The
+credential name matches GitHub.OAuthClientSecretCredential in the example
+configuration:
+
+  LoadCredentialEncrypted=github-oauth-client-secret:/etc/credstore.encrypted/microtun-github-oauth-client-secret
+
+Deployment-specific credential mappings should normally be placed in a systemd
+drop-in instead of editing the packaged unit, for example:
 
   /etc/systemd/system/microtun-firmware-signer.service.d/credentials.conf
 
-After configuring the TOML, signing key file, and systemd credentials:
+After configuring the TOML, signing key file, and OAuth systemd credential:
 
   systemctl daemon-reload
   systemctl enable --now microtun-firmware-signer.service
+  microtun-firmware-signer unlock --key microtun-firmware-prod
   systemctl status microtun-firmware-signer.service
 
-The binary is installed as /usr/bin/microtun-firmware-signer.
+The package installs /usr/bin/microtun-firmware-signer. The same binary provides
+the `unlock` subcommand.

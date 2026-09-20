@@ -6,9 +6,17 @@ Kind = "FirmwareSignerConfig"
 
 [Server]
 # Bind the Rust process only to loopback/private networking. Terminate HTTPS/mTLS
-# at an internal reverse proxy or load balancer.
+# at an internal reverse proxy or load balancer. Public routes are served from the
+# domain root (for example /healthz and /v1/signatures).
 Listen = "127.0.0.1:8080"
-BasePath = "/microtun"
+
+# Manual key unlocks use a separate local-only HTTP API over this Unix-domain
+# socket. Do not reverse-proxy or expose this socket. The packaged systemd unit
+# creates the parent RuntimeDirectory. 0660 allows the service owner/group to
+# run the unlock client; adjust group membership according to your operator model.
+[Unlock]
+SocketPath = "/run/microtun-firmware-signer/unlock.sock"
+SocketMode = 0o660
 
 # This deployment uses one firmware signing key. The key ID is immutable and is
 # referenced by signing requests and authorization policies below.
@@ -16,7 +24,8 @@ BasePath = "/microtun"
 ID = "microtun-firmware-prod"
 PEMPath = "/etc/microtun-firmware-signer/firmware-signing-key.encrypted.pem"
 State = "active"
-PassphraseCredential = "signing-key-passphrase"
+# No passphrase credential is configured here. Active keys always start locked;
+# an operator must run microtun-firmware-signer unlock --key <key-id> after each service start.
 
 # Human identities authenticate through THIS signer's GitHub OAuth App.
 # Register an OAuth App in GitHub and set its Authorization callback URL to the
@@ -31,7 +40,7 @@ OAuthAuthorizeURL = "https://github.com/login/oauth/authorize"
 OAuthAccessTokenURL = "https://github.com/login/oauth/access_token"
 OAuthClientID = "Ov23liEXAMPLE"
 OAuthClientSecretCredential = "github-oauth-client-secret"
-OAuthCallbackURL = "https://signer.example.com/microtun/v1/auth/github/callback"
+OAuthCallbackURL = "https://signer.example.com/v1/auth/github/callback"
 OAuthSessionTTLSeconds = 28800
 OAuthStateTTLSeconds = 600
 

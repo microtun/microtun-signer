@@ -20,8 +20,9 @@ use crate::{
     auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError},
     authorization::Authorizer,
     config::{KeyState, PolicyAction, valid_key_id},
-    key::KeyRing,
+    key::{KeyMaterial, KeyRing, UnlockError, UnlockOutcome},
 };
+use zeroize::Zeroizing;
 
 pub const API_VERSION: &str = "microtun-signing/v1";
 const KEY_PURPOSE: &str = "microtun-firmware";
@@ -35,6 +36,11 @@ pub struct AppState {
     pub keys: Arc<KeyRing>,
     pub auth: Authenticator,
     pub authz: Authorizer,
+}
+
+#[derive(Clone)]
+pub struct UnlockState {
+    pub keys: Arc<KeyRing>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -172,7 +178,8 @@ struct KeyResponseBody {
     purpose: &'static str,
     algorithm: &'static str,
     state: &'static str,
-    public_key: PublicKeyResponse,
+    lock_state: &'static str,
+    public_key: Option<PublicKeyResponse>,
 }
 
 #[derive(Serialize)]
@@ -185,7 +192,7 @@ struct PublicKeyResponse {
 pub async fn get_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> Result<Json<KeyResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let request_id = Ulid::new().to_string();
 
     let key = if valid_key_id(&key_id) {
@@ -219,19 +226,10 @@ pub async fn get_key(
         return Err(error);
     };
 
+    let fingerprint = key.fingerprint();
     let response = KeyResponse {
         api_version: API_VERSION,
-        key: KeyResponseBody {
-            id: key.id().to_owned(),
-            purpose: KEY_PURPOSE,
-            algorithm: KEY_ALGORITHM,
-            state: key.state().as_str(),
-            public_key: PublicKeyResponse {
-                format: KEY_FORMAT,
-                value: key.public_key_pem().to_owned(),
-                fingerprint: key.fingerprint().to_owned(),
-            },
-        },
+        key: key_response_body(key),
     };
 
     audit_best_effort(
@@ -244,13 +242,193 @@ pub async fn get_key(
             None,
             AuditDetails {
                 key_id: Some(key.id()),
-                fingerprint: Some(key.fingerprint()),
+                fingerprint: fingerprint.as_deref(),
                 ..AuditDetails::default()
             },
         ),
     )
     .await;
-    Ok(Json(response))
+    let mut response = Json(response).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, "no-store".parse().expect("valid header"));
+    Ok(response)
+}
+
+fn key_response_body(key: &KeyMaterial) -> KeyResponseBody {
+    let public_key = key
+        .public_key_pem()
+        .zip(key.fingerprint())
+        .map(|(value, fingerprint)| PublicKeyResponse {
+            format: KEY_FORMAT,
+            value,
+            fingerprint,
+        });
+    KeyResponseBody {
+        id: key.id().to_owned(),
+        purpose: KEY_PURPOSE,
+        algorithm: KEY_ALGORITHM,
+        state: key.state().as_str(),
+        lock_state: if key.is_unlocked() {
+            "unlocked"
+        } else {
+            "locked"
+        },
+        public_key,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnlockRequest {
+    passphrase: String,
+}
+
+#[derive(Serialize)]
+pub struct UnlockResponse {
+    api_version: &'static str,
+    request_id: String,
+    already_unlocked: bool,
+    key: KeyResponseBody,
+}
+
+pub async fn unlock_key(
+    State(state): State<UnlockState>,
+    Path(key_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let request_id = Ulid::new().to_string();
+
+    if !is_json_content_type(&headers) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-type",
+            "Unsupported content type",
+            "Unlock requests must use Content-Type: application/json.",
+            &request_id,
+        ));
+    }
+
+    let key = if valid_key_id(&key_id) {
+        state.keys.get(&key_id)
+    } else {
+        None
+    };
+    let Some(key) = key else {
+        tracing::warn!(
+            target: "microtun_firmware_signer::audit",
+            request_id = %request_id,
+            operation = "unlock-key",
+            success = false,
+            reason = "unknown-key",
+            key_id = %key_id,
+            "firmware signer unlock audit event"
+        );
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown-key",
+            "Unknown signing key",
+            "The requested immutable signing key identifier does not exist.",
+            &request_id,
+        ));
+    };
+
+    let request: UnlockRequest = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed-json",
+            "Malformed unlock request",
+            "The request body must contain a JSON string field named passphrase.",
+            &request_id,
+        )
+    })?;
+    if request.passphrase.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "empty-passphrase",
+            "Signing key passphrase is empty",
+            "The unlock passphrase must not be empty.",
+            &request_id,
+        ));
+    }
+    let passphrase = Zeroizing::new(request.passphrase);
+
+    let outcome = match key.unlock(passphrase.as_str()) {
+        Ok(outcome) => outcome,
+        Err(UnlockError::Inactive) => {
+            tracing::warn!(
+                target: "microtun_firmware_signer::audit",
+                request_id = %request_id,
+                operation = "unlock-key",
+                success = false,
+                reason = "key-not-active",
+                key_id = key.id(),
+                "firmware signer unlock audit event"
+            );
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "key-state-conflict",
+                "Signing key is not active",
+                "Only active signing keys can be unlocked.",
+                &request_id,
+            ));
+        }
+        Err(UnlockError::InvalidPassphrase) => {
+            tracing::warn!(
+                target: "microtun_firmware_signer::audit",
+                request_id = %request_id,
+                operation = "unlock-key",
+                success = false,
+                reason = "invalid-passphrase",
+                key_id = key.id(),
+                "firmware signer unlock audit event"
+            );
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "invalid-key-passphrase",
+                "Signing key unlock failed",
+                "The supplied passphrase could not unlock the encrypted signing key.",
+                &request_id,
+            ));
+        }
+        Err(UnlockError::LockPoisoned) => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "key-lock-failure",
+                "Signing key lock failed",
+                "The signing key could not be unlocked due to an internal state error.",
+                &request_id,
+            ));
+        }
+    };
+
+    let fingerprint = key.fingerprint().unwrap_or_default();
+    tracing::info!(
+        target: "microtun_firmware_signer::audit",
+        request_id = %request_id,
+        operation = "unlock-key",
+        success = true,
+        reason = if outcome == UnlockOutcome::AlreadyUnlocked { "already-unlocked" } else { "ok" },
+        key_id = key.id(),
+        key_fingerprint = %fingerprint,
+        "firmware signer unlock audit event"
+    );
+
+    let mut response = Json(UnlockResponse {
+        api_version: API_VERSION,
+        request_id,
+        already_unlocked: outcome == UnlockOutcome::AlreadyUnlocked,
+        key: key_response_body(key),
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, "no-store".parse().expect("valid header"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, "no-cache".parse().expect("valid header"));
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,13 +595,21 @@ pub async fn create_signature(
     };
 
     // Validation above proved that the immutable key id exists and the
-    // fingerprint/state are acceptable. The keyring never mutates at runtime.
+    // fingerprint/state are acceptable and the key is currently unlocked.
     let key = state
         .keys
         .get(&request_key_id)
         .expect("validated key must remain present in immutable keyring");
     let message_sha256 = hex::encode(Sha256::digest(validated.digest));
-    let signature = key.sign_digest(&validated.digest);
+    let signature = key.sign_digest(&validated.digest).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::LOCKED,
+            "key-locked",
+            "Signing key is locked",
+            "The requested signing key must be manually unlocked before it can create signatures.",
+            &attempt_request_id,
+        )
+    })?;
 
     audit_best_effort(
         &state,
@@ -480,20 +666,28 @@ fn validate_signing_request(
     let Some(key) = state.keys.get(&request.key.id) else {
         return Err(unknown_key_error());
     };
-    if request.key.fingerprint != key.fingerprint() {
-        return Err(ApiError::without_request_id(
-            StatusCode::CONFLICT,
-            "key-fingerprint-mismatch",
-            "Signing key fingerprint mismatch",
-            "The requested key fingerprint does not match the immutable key identifier.",
-        ));
-    }
     if key.state() != KeyState::Active {
         return Err(ApiError::without_request_id(
             StatusCode::CONFLICT,
             "key-state-conflict",
             "Signing key is not active",
             "The requested key is available for metadata lookup but cannot create new signatures.",
+        ));
+    }
+    let Some(fingerprint) = key.fingerprint() else {
+        return Err(ApiError::without_request_id(
+            StatusCode::LOCKED,
+            "key-locked",
+            "Signing key is locked",
+            "The requested signing key must be manually unlocked before it can create signatures.",
+        ));
+    };
+    if request.key.fingerprint != fingerprint {
+        return Err(ApiError::without_request_id(
+            StatusCode::CONFLICT,
+            "key-fingerprint-mismatch",
+            "Signing key fingerprint mismatch",
+            "The requested key fingerprint does not match the immutable key identifier.",
         ));
     }
     if request.signature_algorithm != SIGNATURE_ALGORITHM {

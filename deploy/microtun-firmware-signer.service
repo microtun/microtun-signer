@@ -7,14 +7,10 @@ Wants=network-online.target
 Type=simple
 User=microtun-firmware-signer
 Group=microtun-firmware-signer
-
-# The credential names below match config.toml. Prefer a drop-in under
-# /etc/systemd/system/microtun-firmware-signer.service.d/ so package upgrades do
-# not overwrite deployment-specific credential configuration.
-LoadCredentialEncrypted=signing-key-passphrase:/etc/credstore.encrypted/microtun-signing-key-passphrase
 LoadCredentialEncrypted=github-oauth-client-secret:/etc/credstore.encrypted/microtun-github-oauth-client-secret
-
-ExecStart=/usr/bin/microtun-firmware-signer --config /etc/microtun-firmware-signer/config.toml
+RuntimeDirectory=microtun-firmware-signer
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/microtun-firmware-signer
 Restart=on-failure
 RestartSec=2s
 UMask=0077
