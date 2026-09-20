@@ -17,6 +17,5 @@ Depends:
  adduser,
  systemd
 Description: Microtun firmware signing service
- HTTP service for signing Microtun firmware digests with a configured Ed25519
- signing key. It supports GitHub OAuth identities and GitHub Actions OIDC identities
- with an explicit authorization policy, plus a local interactive key-unlock subcommand.
+ A small Rust service for signing MCUboot SHA-256 firmware digests with 
+ encrypted Ed25519 keys.

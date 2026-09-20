@@ -5,8 +5,9 @@ The package intentionally installs the systemd unit disabled and does not start
 it during installation. The installed /etc/microtun-firmware-signer/config.toml
 is an example configuration and must be reviewed before first use.
 
-The service runs as the dedicated microtun-firmware-signer user and group. If an
-encrypted signing key is stored under /etc/microtun-firmware-signer, a typical
+The package creates the dedicated microtun-firmware-signer system user and group
+during configuration. If an encrypted signing key is stored under
+/etc/microtun-firmware-signer, a typical
 secure ownership/mode is:
 
   root:microtun-firmware-signer 0640
