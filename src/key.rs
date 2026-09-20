@@ -199,19 +199,28 @@ fn load_optional_secret(
         return Ok(Some(Zeroizing::new(value)));
     }
 
-    let path = if let Some(path) = explicit_file {
-        Some(std::path::PathBuf::from(path))
+    let (path, check_permissions) = if let Some(path) = explicit_file {
+        (Some(std::path::PathBuf::from(path)), true)
     } else {
-        std::env::var_os("CREDENTIALS_DIRECTORY")
-            .map(std::path::PathBuf::from)
-            .map(|dir| dir.join(systemd_credential_name))
-            .filter(|path| path.exists())
+        (
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(std::path::PathBuf::from)
+                .map(|dir| dir.join(systemd_credential_name))
+                .filter(|path| path.exists()),
+            false,
+        )
     };
 
     let Some(path) = path else {
         return Ok(None);
     };
-    check_secret_file_permissions(&path)?;
+
+    // Explicit secret files are managed by the caller and must be owner-only.
+    // systemd credentials are protected by systemd's credential directory and
+    // service sandboxing, and may legitimately be exposed with mode 0440.
+    if check_permissions {
+        check_secret_file_permissions(&path)?;
+    }
     let mut value = fs::read_to_string(&path)
         .with_context(|| format!("failed to read {label} from {}", path.display()))?;
     while value.ends_with('\n') || value.ends_with('\r') {
