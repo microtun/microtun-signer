@@ -2,15 +2,17 @@
 
 A small Rust service for signing MCUboot SHA-256 firmware digests with encrypted Ed25519 keys.
 
-The signer is designed to keep key custody separate from CI: callers authenticate with GitHub, authorization is defined explicitly in TOML, and signing keys are only decrypted in memory after a local operator unlocks them.
+The signer keeps key custody separate from CI: callers authenticate with GitHub, authorization is defined explicitly in TOML, and signing keys are only decrypted in memory after a local operator unlocks them.
 
 ## Security model
 
 - Signing keys are encrypted PKCS#8 PEM files and always start **locked** after service startup.
+- Each immutable key ID is pinned to a configured SHA-256 public-key fingerprint. Unlocking fails if the encrypted key has been replaced with different key material.
 - Key passphrases are entered interactively through `microtun-firmware-signer unlock` and sent only over a local Unix-domain socket.
 - Human users authenticate through the signer's GitHub OAuth flow; GitHub Actions authenticates with GitHub OIDC. Raw GitHub OAuth tokens are not accepted by the signing API.
 - `[[Policy]]` entries bind named identities to allowed actions and key IDs.
-- Signing is restricted to release-tag context; GitHub Actions requests must also match the authenticated repository, ref, commit, workflow, event, run ID, and run attempt.
+- GitHub Actions signing is restricted to authenticated release-tag refs. Repository, commit, ref, workflow, event, run ID, and run attempt come directly from the verified OIDC token; clients do not echo that provenance in the request body.
+- Human OAuth sessions are trusted signers. Signing requests contain no caller-supplied release or GitHub provenance metadata.
 - The TCP listener is intended for loopback/private networking. Terminate TLS at a trusted reverse proxy or load balancer. Never expose or proxy the unlock socket.
 
 ## Build and run
@@ -22,7 +24,18 @@ cargo build --release --locked
 cp config.example.toml config.toml
 ```
 
-Configure the GitHub identities, policies, OAuth application, and encrypted signing key in `config.toml`. For local development, provide the OAuth client secret directly or via a file:
+Configure the GitHub identities, policies, OAuth application, and encrypted signing key in `config.toml`.
+
+Each key also needs its public-key fingerprint. One way to calculate it with OpenSSL is:
+
+```bash
+openssl pkey -in firmware-signing-key.encrypted.pem -pubout -outform DER \
+  | sha256sum
+```
+
+Set `Key.Fingerprint` to `sha256:<hex-output>`. The signer verifies this fingerprint every time the key is unlocked, preventing a key ID from silently being rebound to different key material.
+
+For local development, provide the OAuth client secret directly or via a file:
 
 ```bash
 export MICROTUN_SIGNER_GITHUB_OAUTH_CLIENT_SECRET='...'
@@ -49,39 +62,51 @@ GET  /healthz
 GET  /v1/auth/github/login
 GET  /v1/auth/github/callback
 GET  /v1/keys/{key_id}
-POST /v1/signatures
+POST /v1/keys/{key_id}/signatures
 ```
 
-`POST /v1/signatures` requires `Authorization: Bearer <token>` and `Content-Type: application/json`. The message is exactly one 32-byte MCUboot SHA-256 digest encoded as base64; the response contains a base64 Ed25519 signature.
+`POST /v1/keys/{key_id}/signatures` requires `Authorization: Bearer <token>` and `Content-Type: application/json`. `digest` is exactly one 32-byte MCUboot SHA-256 digest encoded as base64. The returned `signature` is a base64 Ed25519 signature.
 
-Example request shape:
+### GitHub Actions
+
+Actions callers send only the digest:
 
 ```json
 {
-  "api_version": "microtun-signing/v1",
-  "key": {
-    "id": "microtun-firmware-prod",
-    "fingerprint": "sha256:<public-key-fingerprint>"
-  },
-  "signature_algorithm": "ed25519",
-  "message": {
-    "type": "mcuboot-sha256",
-    "encoding": "base64",
-    "value": "<32-byte-digest-as-base64>"
-  },
-  "context": {
-    "board": "<board>",
-    "version": "1.2.3",
-    "repository": "owner/repo",
-    "repository_id": "123456789",
-    "ref": "refs/tags/v1.2.3",
-    "ref_type": "tag",
-    "commit_sha": "<git-sha>"
-  }
+  "digest": "<32-byte-digest-as-base64>"
 }
 ```
 
-GitHub Actions callers must additionally provide `event_name`, `workflow_ref`, `run_id`, and `run_attempt` matching the OIDC token claims.
+The signer still requires an authenticated GitHub tag ref for Actions callers. Tag names are treated as opaque provenance; no release metadata is derived from them or accepted in the request body.
+
+Repository, repository ID, commit SHA, ref, actor, workflow, event, run ID, and run attempt are taken directly from the verified OIDC claims and recorded in the audit log.
+
+### Human OAuth session
+
+Human callers use the same minimal request body:
+
+```json
+{
+  "digest": "<32-byte-digest-as-base64>"
+}
+```
+
+The signing body accepts no additional metadata: repository, ref, commit, workflow, algorithm, message type, encoding, key ID, and key fingerprint are all server-side or fixed by the endpoint contract.
+
+A successful signing response is intentionally small:
+
+```json
+{
+  "request_id": "01...",
+  "key": {
+    "id": "microtun-firmware-prod",
+    "fingerprint": "sha256:..."
+  },
+  "signature": "<base64-ed25519-signature>"
+}
+```
+
+`GET /v1/keys/{key_id}` returns the key ID, lifecycle state, lock state, pinned fingerprint, and the public key PEM when the key is unlocked.
 
 ## Development
 

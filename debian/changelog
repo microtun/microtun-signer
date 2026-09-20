@@ -1,8 +1,14 @@
-microtun-firmware-signer (0.1.1) UNRELEASED; urgency=medium
+microtun-firmware-signer (0.2.0) UNRELEASED; urgency=medium
+
+  * Simplified API 
+
+ -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 17:32:40 +0200
+
+microtun-firmware-signer (0.1.1) unstable; urgency=medium
 
   * Various packaging fixes 
 
- -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 14:29:25 +0200
+ -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 17:32:28 +0200
 
 microtun-firmware-signer (0.1.0) unstable; urgency=medium
 

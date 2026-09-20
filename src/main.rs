@@ -85,11 +85,6 @@ struct UnlockResponse {
 struct UnlockKey {
     id: String,
     lock_state: String,
-    public_key: Option<PublicKey>,
-}
-
-#[derive(Deserialize)]
-struct PublicKey {
     fingerprint: String,
 }
 
@@ -146,7 +141,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
         .route("/v1/auth/github/login", get(github_oauth_login))
         .route("/v1/auth/github/callback", get(github_oauth_callback))
         .route("/v1/keys/{key_id}", get(get_key))
-        .route("/v1/signatures", post(create_signature))
+        .route("/v1/keys/{key_id}/signatures", post(create_signature))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -257,11 +252,7 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
     if unlocked.key.lock_state != "unlocked" {
         bail!("unlock API returned success but key is not unlocked");
     }
-    let fingerprint = unlocked
-        .key
-        .public_key
-        .map(|key| key.fingerprint)
-        .unwrap_or_else(|| "unknown".to_owned());
+    let fingerprint = unlocked.key.fingerprint;
     if unlocked.already_unlocked {
         println!(
             "key {} was already unlocked ({fingerprint}); request {}",

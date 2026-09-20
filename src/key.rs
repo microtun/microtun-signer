@@ -48,13 +48,13 @@ pub struct KeyMaterial {
     id: String,
     state: KeyState,
     encrypted_pem: Zeroizing<String>,
+    fingerprint: String,
     unlocked: RwLock<Option<UnlockedKeyMaterial>>,
 }
 
 struct UnlockedKeyMaterial {
     signing_key: SigningKey,
     public_key_pem: String,
-    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,8 @@ pub enum UnlockError {
     Inactive,
     #[error("signing key passphrase is invalid or the encrypted key cannot be decrypted")]
     InvalidPassphrase,
+    #[error("signing key does not match its configured immutable fingerprint")]
+    FingerprintMismatch,
     #[error("signing key lock is poisoned")]
     LockPoisoned,
 }
@@ -92,11 +94,12 @@ impl KeyMaterial {
             id: config.id.clone(),
             state: config.state,
             encrypted_pem: Zeroizing::new(pem),
+            fingerprint: config.fingerprint.clone(),
             unlocked: RwLock::new(None),
         })
     }
 
-    fn unlocked_from_signing_key(signing_key: SigningKey) -> Result<UnlockedKeyMaterial> {
+    fn unlocked_from_signing_key(signing_key: SigningKey) -> Result<(UnlockedKeyMaterial, String)> {
         let verifying_key = signing_key.verifying_key();
         let public_der = verifying_key
             .to_public_key_der()
@@ -112,11 +115,13 @@ impl KeyMaterial {
             hex::encode(Sha256::digest(public_der.as_bytes()))
         );
 
-        Ok(UnlockedKeyMaterial {
-            signing_key,
-            public_key_pem,
+        Ok((
+            UnlockedKeyMaterial {
+                signing_key,
+                public_key_pem,
+            },
             fingerprint,
-        })
+        ))
     }
 
     pub fn id(&self) -> &str {
@@ -141,11 +146,8 @@ impl KeyMaterial {
             .and_then(|guard| guard.as_ref().map(|key| key.public_key_pem.clone()))
     }
 
-    pub fn fingerprint(&self) -> Option<String> {
-        self.unlocked
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|key| key.fingerprint.clone()))
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     pub fn unlock(&self, passphrase: &str) -> Result<UnlockOutcome, UnlockError> {
@@ -168,8 +170,11 @@ impl KeyMaterial {
             passphrase.as_bytes(),
         )
         .map_err(|_| UnlockError::InvalidPassphrase)?;
-        let unlocked = Self::unlocked_from_signing_key(signing_key)
+        let (unlocked, fingerprint) = Self::unlocked_from_signing_key(signing_key)
             .map_err(|_| UnlockError::InvalidPassphrase)?;
+        if fingerprint != self.fingerprint {
+            return Err(UnlockError::FingerprintMismatch);
+        }
 
         let mut guard = self
             .unlocked
@@ -303,6 +308,8 @@ mod tests {
             encrypted_pem: Zeroizing::new(
                 include_str!("../tests/fixtures/test-ed25519-encrypted.pem").to_owned(),
             ),
+            fingerprint: "sha256:ddaf63cf52130558d20c3889805c7c737dbb1d26cef53553dc3dbf556924c5ca"
+                .into(),
             unlocked: RwLock::new(None),
         }
     }
@@ -311,7 +318,10 @@ mod tests {
     fn encrypted_test_key_starts_locked_then_unlocks_and_signs_exact_digest() {
         let key = test_key("test-key", KeyState::Active);
         assert!(!key.is_unlocked());
-        assert!(key.fingerprint().is_none());
+        assert_eq!(
+            key.fingerprint(),
+            "sha256:ddaf63cf52130558d20c3889805c7c737dbb1d26cef53553dc3dbf556924c5ca"
+        );
         assert!(key.public_key_pem().is_none());
         assert!(key.sign_digest(&[0x5a; 32]).is_none());
 
@@ -334,7 +344,7 @@ mod tests {
         .unwrap();
         let verifying_key = VerifyingKey::from(&signing_key);
         verifying_key.verify(&digest, &signature).unwrap();
-        assert!(key.fingerprint().unwrap().starts_with("sha256:"));
+        assert!(key.fingerprint().starts_with("sha256:"));
         assert!(
             key.public_key_pem()
                 .unwrap()
@@ -348,6 +358,18 @@ mod tests {
         assert!(matches!(
             key.unlock("wrong"),
             Err(UnlockError::InvalidPassphrase)
+        ));
+        assert!(!key.is_unlocked());
+    }
+
+    #[test]
+    fn configured_fingerprint_pins_the_immutable_key_id() {
+        let mut key = test_key("test-key", KeyState::Active);
+        key.fingerprint =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".into();
+        assert!(matches!(
+            key.unlock("test-passphrase"),
+            Err(UnlockError::FingerprintMismatch)
         ));
         assert!(!key.is_unlocked());
     }

@@ -11,9 +11,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use semver::Version;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
@@ -23,13 +21,6 @@ use crate::{
     key::{KeyMaterial, KeyRing, UnlockError, UnlockOutcome},
 };
 use zeroize::Zeroizing;
-
-pub const API_VERSION: &str = "microtun-signing/v1";
-const KEY_PURPOSE: &str = "microtun-firmware";
-const KEY_ALGORITHM: &str = "ed25519";
-const KEY_FORMAT: &str = "spki-pem";
-const SIGNATURE_ALGORITHM: &str = "ed25519";
-const MESSAGE_TYPE: &str = "mcuboot-sha256";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,7 +42,7 @@ struct AuditRecord {
     reason: String,
     key_id: Option<String>,
     key_fingerprint: Option<String>,
-    message_sha256: Option<String>,
+    firmware_digest: Option<String>,
     identity_id: Option<String>,
     principal: Option<String>,
     auth_method: Option<String>,
@@ -62,14 +53,15 @@ struct AuditRecord {
     github_user_id: Option<String>,
     actor: Option<String>,
     actor_id: Option<String>,
+    repository: Option<String>,
     repository_id: Option<String>,
     git_ref: Option<String>,
+    commit_sha: Option<String>,
+    event_name: Option<String>,
     workflow_ref: Option<String>,
     run_id: Option<String>,
     run_attempt: Option<String>,
     jti: Option<String>,
-    board: Option<String>,
-    version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -168,25 +160,11 @@ pub async fn github_oauth_callback(
 
 #[derive(Serialize)]
 pub struct KeyResponse {
-    api_version: &'static str,
-    key: KeyResponseBody,
-}
-
-#[derive(Serialize)]
-struct KeyResponseBody {
     id: String,
-    purpose: &'static str,
-    algorithm: &'static str,
     state: &'static str,
     lock_state: &'static str,
-    public_key: Option<PublicKeyResponse>,
-}
-
-#[derive(Serialize)]
-struct PublicKeyResponse {
-    format: &'static str,
-    value: String,
     fingerprint: String,
+    public_key_pem: Option<String>,
 }
 
 pub async fn get_key(
@@ -226,12 +204,7 @@ pub async fn get_key(
         return Err(error);
     };
 
-    let fingerprint = key.fingerprint();
-    let response = KeyResponse {
-        api_version: API_VERSION,
-        key: key_response_body(key),
-    };
-
+    let response = key_response(key);
     audit_best_effort(
         &state,
         audit_record(
@@ -242,12 +215,13 @@ pub async fn get_key(
             None,
             AuditDetails {
                 key_id: Some(key.id()),
-                fingerprint: fingerprint.as_deref(),
+                fingerprint: Some(key.fingerprint()),
                 ..AuditDetails::default()
             },
         ),
     )
     .await;
+
     let mut response = Json(response).into_response();
     response
         .headers_mut()
@@ -255,26 +229,17 @@ pub async fn get_key(
     Ok(response)
 }
 
-fn key_response_body(key: &KeyMaterial) -> KeyResponseBody {
-    let public_key = key
-        .public_key_pem()
-        .zip(key.fingerprint())
-        .map(|(value, fingerprint)| PublicKeyResponse {
-            format: KEY_FORMAT,
-            value,
-            fingerprint,
-        });
-    KeyResponseBody {
+fn key_response(key: &KeyMaterial) -> KeyResponse {
+    KeyResponse {
         id: key.id().to_owned(),
-        purpose: KEY_PURPOSE,
-        algorithm: KEY_ALGORITHM,
         state: key.state().as_str(),
         lock_state: if key.is_unlocked() {
             "unlocked"
         } else {
             "locked"
         },
-        public_key,
+        fingerprint: key.fingerprint().to_owned(),
+        public_key_pem: key.public_key_pem(),
     }
 }
 
@@ -286,10 +251,9 @@ struct UnlockRequest {
 
 #[derive(Serialize)]
 pub struct UnlockResponse {
-    api_version: &'static str,
     request_id: String,
     already_unlocked: bool,
-    key: KeyResponseBody,
+    key: KeyResponse,
 }
 
 pub async fn unlock_key(
@@ -392,6 +356,25 @@ pub async fn unlock_key(
                 &request_id,
             ));
         }
+        Err(UnlockError::FingerprintMismatch) => {
+            tracing::error!(
+                target: "microtun_firmware_signer::audit",
+                request_id = %request_id,
+                operation = "unlock-key",
+                success = false,
+                reason = "key-fingerprint-mismatch",
+                key_id = key.id(),
+                key_fingerprint = key.fingerprint(),
+                "firmware signer unlock audit event"
+            );
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "key-fingerprint-mismatch",
+                "Signing key fingerprint mismatch",
+                "The encrypted key does not match the fingerprint configured for this immutable key identifier.",
+                &request_id,
+            ));
+        }
         Err(UnlockError::LockPoisoned) => {
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -403,7 +386,7 @@ pub async fn unlock_key(
         }
     };
 
-    let fingerprint = key.fingerprint().unwrap_or_default();
+    let fingerprint = key.fingerprint();
     tracing::info!(
         target: "microtun_firmware_signer::audit",
         request_id = %request_id,
@@ -416,10 +399,9 @@ pub async fn unlock_key(
     );
 
     let mut response = Json(UnlockResponse {
-        api_version: API_VERSION,
         request_id,
         already_unlocked: outcome == UnlockOutcome::AlreadyUnlocked,
-        key: key_response_body(key),
+        key: key_response(key),
     })
     .into_response();
     response
@@ -432,66 +414,16 @@ pub async fn unlock_key(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SigningRequest {
-    api_version: String,
-    key: RequestKey,
-    signature_algorithm: String,
-    message: RequestMessage,
-    context: RequestContext,
-}
-
-#[derive(Debug, Deserialize)]
-struct RequestKey {
-    id: String,
-    fingerprint: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RequestMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    encoding: String,
-    value: String,
-}
-
-/// Release context supplied by the caller.
-///
-/// Repository/ref/commit fields are useful to both Actions and a future local
-/// GitHub identity flow. Workflow-run fields are optional in the wire model so
-/// that local identities do not need fake Actions metadata; the current Actions
-/// verifier still requires exact values for all of them.
-#[derive(Debug, Clone, Deserialize)]
-struct RequestContext {
-    board: String,
-    version: String,
-    repository: String,
-    repository_id: String,
-    #[serde(rename = "ref")]
-    git_ref: String,
-    ref_type: String,
-    commit_sha: String,
-    #[serde(default)]
-    event_name: Option<String>,
-    #[serde(default)]
-    workflow_ref: Option<String>,
-    #[serde(default)]
-    run_id: Option<String>,
-    #[serde(default)]
-    run_attempt: Option<String>,
-}
-
-struct ValidatedSigningRequest {
-    digest: [u8; 32],
-    context: RequestContext,
+    digest: String,
 }
 
 #[derive(Serialize)]
 pub struct SignatureResponse {
-    api_version: &'static str,
     request_id: String,
     key: SignatureResponseKey,
-    signature_algorithm: &'static str,
-    signature: SignatureValue,
+    signature: String,
 }
 
 #[derive(Serialize)]
@@ -500,14 +432,9 @@ struct SignatureResponseKey {
     fingerprint: String,
 }
 
-#[derive(Serialize)]
-struct SignatureValue {
-    encoding: &'static str,
-    value: String,
-}
-
 pub async fn create_signature(
     State(state): State<AppState>,
+    Path(key_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SignatureResponse>, ApiError> {
@@ -549,7 +476,7 @@ pub async fn create_signature(
                 StatusCode::BAD_REQUEST,
                 "malformed-json",
                 "Malformed signing request",
-                "The request body is not a valid signing-service JSON object.",
+                "The request body must contain exactly one base64-encoded SHA-256 digest.",
                 &attempt_request_id,
             );
             audit_best_effort(
@@ -560,7 +487,10 @@ pub async fn create_signature(
                     false,
                     error.title,
                     Some(&principal),
-                    AuditDetails::default(),
+                    AuditDetails {
+                        key_id: Some(&key_id),
+                        ..AuditDetails::default()
+                    },
                 ),
             )
             .await;
@@ -568,10 +498,8 @@ pub async fn create_signature(
         }
     };
 
-    let request_key_id = request.key.id.clone();
-    let request_fingerprint = request.key.fingerprint.clone();
-    let validated = match validate_signing_request(&state, &principal, request) {
-        Ok(validated) => validated,
+    let digest = match validate_signing_request(&state, &principal, &key_id, request) {
+        Ok(digest) => digest,
         Err(mut error) => {
             error.request_id = attempt_request_id.clone();
             audit_best_effort(
@@ -583,8 +511,7 @@ pub async fn create_signature(
                     error.title,
                     Some(&principal),
                     AuditDetails {
-                        key_id: Some(&request_key_id),
-                        fingerprint: Some(&request_fingerprint),
+                        key_id: Some(&key_id),
                         ..AuditDetails::default()
                     },
                 ),
@@ -594,14 +521,12 @@ pub async fn create_signature(
         }
     };
 
-    // Validation above proved that the immutable key id exists and the
-    // fingerprint/state are acceptable and the key is currently unlocked.
     let key = state
         .keys
-        .get(&request_key_id)
+        .get(&key_id)
         .expect("validated key must remain present in immutable keyring");
-    let message_sha256 = hex::encode(Sha256::digest(validated.digest));
-    let signature = key.sign_digest(&validated.digest).ok_or_else(|| {
+    let firmware_digest = hex::encode(digest);
+    let signature = key.sign_digest(&digest).ok_or_else(|| {
         ApiError::new(
             StatusCode::LOCKED,
             "key-locked",
@@ -620,50 +545,39 @@ pub async fn create_signature(
             "ok",
             Some(&principal),
             AuditDetails {
-                key_id: Some(&request_key_id),
-                fingerprint: Some(&request_fingerprint),
-                message_sha256: Some(&message_sha256),
-                context: Some(&validated.context),
+                key_id: Some(&key_id),
+                fingerprint: Some(key.fingerprint()),
+                firmware_digest: Some(&firmware_digest),
             },
         ),
     )
     .await;
 
     Ok(Json(SignatureResponse {
-        api_version: API_VERSION,
         request_id: attempt_request_id,
         key: SignatureResponseKey {
-            id: request_key_id,
-            fingerprint: request_fingerprint,
+            id: key_id,
+            fingerprint: key.fingerprint().to_owned(),
         },
-        signature_algorithm: SIGNATURE_ALGORITHM,
-        signature: SignatureValue {
-            encoding: "base64",
-            value: BASE64.encode(signature),
-        },
+        signature: BASE64.encode(signature),
     }))
 }
 
 fn validate_signing_request(
     state: &AppState,
     principal: &AuthPrincipal,
+    key_id: &str,
     request: SigningRequest,
-) -> Result<ValidatedSigningRequest, ApiError> {
-    if request.api_version != API_VERSION {
-        return Err(ApiError::unprocessable(
-            "api-version-mismatch",
-            "Unsupported API version",
-            "The request api_version must be microtun-signing/v1.",
-        ));
-    }
-    if !valid_key_id(&request.key.id) {
+) -> Result<[u8; 32], ApiError> {
+    if !valid_key_id(key_id) {
         return Err(unknown_key_error());
     }
     state
         .authz
-        .authorize(principal, PolicyAction::Sign, &request.key.id)
+        .authorize(principal, PolicyAction::Sign, key_id)
         .map_err(|_| policy_denied_error())?;
-    let Some(key) = state.keys.get(&request.key.id) else {
+
+    let Some(key) = state.keys.get(key_id) else {
         return Err(unknown_key_error());
     };
     if key.state() != KeyState::Active {
@@ -674,65 +588,36 @@ fn validate_signing_request(
             "The requested key is available for metadata lookup but cannot create new signatures.",
         ));
     }
-    let Some(fingerprint) = key.fingerprint() else {
+    if !key.is_unlocked() {
         return Err(ApiError::without_request_id(
             StatusCode::LOCKED,
             "key-locked",
             "Signing key is locked",
             "The requested signing key must be manually unlocked before it can create signatures.",
         ));
-    };
-    if request.key.fingerprint != fingerprint {
-        return Err(ApiError::without_request_id(
-            StatusCode::CONFLICT,
-            "key-fingerprint-mismatch",
-            "Signing key fingerprint mismatch",
-            "The requested key fingerprint does not match the immutable key identifier.",
-        ));
-    }
-    if request.signature_algorithm != SIGNATURE_ALGORITHM {
-        return Err(ApiError::unprocessable(
-            "unsupported-signature-algorithm",
-            "Unsupported signature algorithm",
-            "signature_algorithm must be ed25519.",
-        ));
-    }
-    if request.message.message_type != MESSAGE_TYPE || request.message.encoding != "base64" {
-        return Err(ApiError::unprocessable(
-            "unsupported-message-format",
-            "Unsupported signing message",
-            "The signer only accepts base64-encoded mcuboot-sha256 messages.",
-        ));
     }
 
-    let decoded = BASE64
-        .decode(request.message.value.as_bytes())
-        .map_err(|_| {
-            ApiError::unprocessable(
-                "invalid-message-base64",
-                "Invalid signing message",
-                "message.value is not valid base64.",
-            )
-        })?;
+    let decoded = BASE64.decode(request.digest.as_bytes()).map_err(|_| {
+        ApiError::unprocessable(
+            "invalid-digest-base64",
+            "Invalid firmware digest",
+            "digest must be valid base64.",
+        )
+    })?;
     let digest: [u8; 32] = decoded.try_into().map_err(|bytes: Vec<u8>| {
         ApiError::unprocessable(
-            "invalid-message-length",
-            "Invalid signing message length",
+            "invalid-digest-length",
+            "Invalid firmware digest length",
             if bytes.len() < 32 {
-                "The decoded MCUboot SHA-256 signing vector is shorter than 32 bytes."
+                "The decoded SHA-256 digest is shorter than 32 bytes."
             } else {
-                "The decoded MCUboot SHA-256 signing vector is longer than 32 bytes."
+                "The decoded SHA-256 digest is longer than 32 bytes."
             },
         )
     })?;
 
-    validate_release_version(&request.context.version)?;
-    authorize_context(principal, &request.context)?;
-
-    Ok(ValidatedSigningRequest {
-        digest,
-        context: request.context,
-    })
+    validate_signing_context(principal)?;
+    Ok(digest)
 }
 
 fn unknown_key_error() -> ApiError {
@@ -744,93 +629,37 @@ fn unknown_key_error() -> ApiError {
     )
 }
 
-fn validate_release_version(version: &str) -> Result<(), ApiError> {
-    let parsed = Version::parse(version).map_err(|_| {
-        ApiError::unprocessable(
-            "invalid-release-version",
-            "Invalid release version",
-            "context.version must be release SemVer in canonical X.Y.Z form.",
-        )
-    })?;
-    if !parsed.pre.is_empty()
-        || !parsed.build.is_empty()
-        || format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch) != version
-    {
-        return Err(ApiError::unprocessable(
-            "invalid-release-version",
-            "Invalid release version",
-            "context.version must be release SemVer in canonical X.Y.Z form.",
-        ));
-    }
-    Ok(())
-}
+fn validate_signing_context(principal: &AuthPrincipal) -> Result<(), ApiError> {
+    let AuthSource::GithubActions(actions) = &principal.source else {
+        return Ok(());
+    };
 
-fn authorize_context(principal: &AuthPrincipal, context: &RequestContext) -> Result<(), ApiError> {
-    match &principal.source {
-        AuthSource::GithubAccount(_) => authorize_release_tag_context(context),
-        AuthSource::GithubActions(actions) => authorize_actions_context(actions, context),
-    }
-}
-
-fn authorize_actions_context(
-    actions: &crate::auth::GithubActionsIdentity,
-    context: &RequestContext,
-) -> Result<(), ApiError> {
-    if context.repository != actions.repository || context.repository_id != actions.repository_id {
-        return Err(ApiError::without_request_id(
-            StatusCode::FORBIDDEN,
-            "github-context-mismatch",
-            "Release context does not match authenticated GitHub identity",
-            "The request repository does not match the authenticated GitHub Actions identity.",
-        ));
-    }
-
-    let workflow_matches = context.event_name.as_deref() == Some(actions.event_name.as_str())
-        && context.workflow_ref.as_deref() == Some(actions.workflow_ref.as_str())
-        && context.run_id.as_deref() == Some(actions.run_id.as_str())
-        && context.run_attempt.as_deref() == Some(actions.run_attempt.as_str());
-    let git_matches = context.git_ref == actions.git_ref
-        && context.ref_type == actions.ref_type
-        && context.commit_sha.eq_ignore_ascii_case(&actions.sha);
-
-    if !workflow_matches || !git_matches {
-        return Err(ApiError::without_request_id(
-            StatusCode::FORBIDDEN,
-            "github-actions-context-mismatch",
-            "Release context does not match authenticated GitHub Actions identity",
-            "The request Git/ref/workflow context differs from the authenticated GitHub Actions OIDC identity.",
-        ));
-    }
-
-    authorize_release_tag_context(context)
-}
-
-fn authorize_release_tag_context(context: &RequestContext) -> Result<(), ApiError> {
-    if context.ref_type != "tag" {
+    if actions.ref_type != "tag" {
         return Err(ApiError::without_request_id(
             StatusCode::FORBIDDEN,
             "tag-required",
             "A release tag is required",
-            "Firmware signing requires a tag release context.",
+            "Firmware signing from GitHub Actions requires an authenticated tag ref.",
         ));
     }
-    let tag = context.git_ref.strip_prefix("refs/tags/").ok_or_else(|| {
-        ApiError::without_request_id(
+
+    let Some(tag) = actions.git_ref.strip_prefix("refs/tags/") else {
+        return Err(ApiError::without_request_id(
             StatusCode::FORBIDDEN,
             "tag-required",
             "A release tag is required",
-            "context.ref must be a refs/tags/* reference.",
-        )
-    })?;
-    let tag_version = tag.strip_prefix('v').unwrap_or(tag);
-    if tag_version != context.version {
+            "The authenticated GitHub Actions ref must be under refs/tags/.",
+        ));
+    };
+    if tag.is_empty() {
         return Err(ApiError::without_request_id(
             StatusCode::FORBIDDEN,
-            "tag-version-mismatch",
-            "Release version does not match tag",
-            "context.version must exactly match the release tag (with an optional leading v on the tag).",
+            "tag-required",
+            "A release tag is required",
+            "The authenticated GitHub Actions tag ref must name a tag.",
         ));
     }
+
     Ok(())
 }
 
@@ -931,8 +760,7 @@ fn policy_denied_error() -> ApiError {
 struct AuditDetails<'a> {
     key_id: Option<&'a str>,
     fingerprint: Option<&'a str>,
-    message_sha256: Option<&'a str>,
-    context: Option<&'a RequestContext>,
+    firmware_digest: Option<&'a str>,
 }
 
 fn audit_record(
@@ -958,7 +786,7 @@ fn audit_record(
         reason: reason.to_owned(),
         key_id: details.key_id.map(str::to_owned),
         key_fingerprint: details.fingerprint.map(str::to_owned),
-        message_sha256: details.message_sha256.map(str::to_owned),
+        firmware_digest: details.firmware_digest.map(str::to_owned),
         identity_id: principal.map(|principal| principal.identity_id.clone()),
         principal: principal.map(|principal| principal.principal_key.clone()),
         auth_method: principal.map(|principal| principal.auth_method.to_owned()),
@@ -969,14 +797,15 @@ fn audit_record(
         github_user_id: account.map(|identity| identity.user_id.clone()),
         actor: actions.and_then(|identity| identity.actor.clone()),
         actor_id: actions.and_then(|identity| identity.actor_id.clone()),
+        repository: actions.map(|identity| identity.repository.clone()),
         repository_id: actions.map(|identity| identity.repository_id.clone()),
         git_ref: actions.map(|identity| identity.git_ref.clone()),
+        commit_sha: actions.map(|identity| identity.sha.clone()),
+        event_name: actions.map(|identity| identity.event_name.clone()),
         workflow_ref: actions.map(|identity| identity.workflow_ref.clone()),
         run_id: actions.map(|identity| identity.run_id.clone()),
         run_attempt: actions.map(|identity| identity.run_attempt.clone()),
         jti: principal.and_then(|principal| principal.jti.clone()),
-        board: details.context.map(|context| context.board.clone()),
-        version: details.context.map(|context| context.version.clone()),
     }
 }
 
@@ -989,7 +818,7 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
         reason = %record.reason,
         key_id = record.key_id.as_deref().unwrap_or(""),
         key_fingerprint = record.key_fingerprint.as_deref().unwrap_or(""),
-        message_sha256 = record.message_sha256.as_deref().unwrap_or(""),
+        firmware_digest = record.firmware_digest.as_deref().unwrap_or(""),
         identity_id = record.identity_id.as_deref().unwrap_or(""),
         principal = record.principal.as_deref().unwrap_or(""),
         auth_method = record.auth_method.as_deref().unwrap_or(""),
@@ -1000,14 +829,15 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
         github_user_id = record.github_user_id.as_deref().unwrap_or(""),
         actor = record.actor.as_deref().unwrap_or(""),
         actor_id = record.actor_id.as_deref().unwrap_or(""),
+        repository = record.repository.as_deref().unwrap_or(""),
         repository_id = record.repository_id.as_deref().unwrap_or(""),
         git_ref = record.git_ref.as_deref().unwrap_or(""),
+        commit_sha = record.commit_sha.as_deref().unwrap_or(""),
+        event_name = record.event_name.as_deref().unwrap_or(""),
         workflow_ref = record.workflow_ref.as_deref().unwrap_or(""),
         run_id = record.run_id.as_deref().unwrap_or(""),
         run_attempt = record.run_attempt.as_deref().unwrap_or(""),
         jti = record.jti.as_deref().unwrap_or(""),
-        board = record.board.as_deref().unwrap_or(""),
-        version = record.version.as_deref().unwrap_or(""),
         "firmware signer audit event"
     );
 }
@@ -1108,32 +938,17 @@ mod tests {
     use crate::auth::{AuthSource, GithubAccountIdentity, GithubActionsIdentity};
 
     #[test]
-    fn only_canonical_release_semver_is_accepted() {
-        assert!(validate_release_version("1.2.3").is_ok());
-        assert!(validate_release_version("v1.2.3").is_err());
-        assert!(validate_release_version("1.2.3-rc.1").is_err());
-        assert!(validate_release_version("1.2.3+build").is_err());
+    fn signing_request_accepts_only_digest() {
+        let request: SigningRequest = serde_json::from_str(r#"{"digest":"AA=="}"#).unwrap();
+        assert_eq!(request.digest, "AA==");
+        assert!(
+            serde_json::from_str::<SigningRequest>(r#"{"digest":"AA==","unexpected":"x"}"#)
+                .is_err()
+        );
     }
 
-    fn release_context() -> RequestContext {
-        RequestContext {
-            board: "board".into(),
-            version: "1.2.3".into(),
-            repository: "owner/repo".into(),
-            repository_id: "123".into(),
-            git_ref: "refs/tags/v1.2.3".into(),
-            ref_type: "tag".into(),
-            commit_sha: "ABCDEF".into(),
-            event_name: Some("push".into()),
-            workflow_ref: Some("owner/repo/.github/workflows/release.yml@refs/tags/v1.2.3".into()),
-            run_id: Some("42".into()),
-            run_attempt: Some("1".into()),
-        }
-    }
-
-    #[test]
-    fn actions_context_still_requires_exact_workflow_metadata() {
-        let principal = AuthPrincipal {
+    fn actions_principal(git_ref: &str, ref_type: &str) -> AuthPrincipal {
+        AuthPrincipal {
             identity_id: "release-actions".into(),
             principal_key: "github-actions:repository:123".into(),
             auth_method: "github-actions-oidc",
@@ -1146,24 +961,31 @@ mod tests {
                 repository_id: "123".into(),
                 actor: Some("user".into()),
                 actor_id: Some("456".into()),
-                git_ref: "refs/tags/v1.2.3".into(),
-                ref_type: "tag".into(),
+                git_ref: git_ref.into(),
+                ref_type: ref_type.into(),
                 sha: "abcdef".into(),
                 workflow_ref: "owner/repo/.github/workflows/release.yml@refs/tags/v1.2.3".into(),
                 event_name: "push".into(),
                 run_id: "42".into(),
                 run_attempt: "1".into(),
             })),
-        };
-        let mut context = release_context();
-
-        assert!(authorize_context(&principal, &context).is_ok());
-        context.workflow_ref = None;
-        assert!(authorize_context(&principal, &context).is_err());
+        }
     }
 
     #[test]
-    fn account_context_requires_a_release_tag_but_not_actions_metadata() {
+    fn actions_signing_accepts_an_authenticated_tag_without_parsing_it_as_a_version() {
+        let principal = actions_principal("refs/tags/release-candidate", "tag");
+        assert!(validate_signing_context(&principal).is_ok());
+    }
+
+    #[test]
+    fn actions_signing_requires_an_authenticated_release_tag() {
+        let principal = actions_principal("refs/heads/main", "branch");
+        assert!(validate_signing_context(&principal).is_err());
+    }
+
+    #[test]
+    fn human_signing_has_no_release_metadata_requirement() {
         let principal = AuthPrincipal {
             identity_id: "maintainer".into(),
             principal_key: "github-account:42".into(),
@@ -1177,15 +999,7 @@ mod tests {
                 login: "octocat".into(),
             }),
         };
-        let mut context = release_context();
-        context.event_name = None;
-        context.workflow_ref = None;
-        context.run_id = None;
-        context.run_attempt = None;
 
-        assert!(authorize_context(&principal, &context).is_ok());
-        context.git_ref = "refs/heads/main".into();
-        context.ref_type = "branch".into();
-        assert!(authorize_context(&principal, &context).is_err());
+        assert!(validate_signing_context(&principal).is_ok());
     }
 }

@@ -7,7 +7,7 @@ Kind = "FirmwareSignerConfig"
 [Server]
 # Bind the Rust process only to loopback/private networking. Terminate HTTPS/mTLS
 # at an internal reverse proxy or load balancer. Public routes are served from the
-# domain root (for example /healthz and /v1/signatures).
+# domain root (for example /healthz and /v1/keys/{key_id}/signatures).
 Listen = "127.0.0.1:8080"
 
 # Manual key unlocks use a separate local-only HTTP API over this Unix-domain
@@ -19,10 +19,13 @@ SocketPath = "/run/microtun-firmware-signer/unlock.sock"
 SocketMode = 0o660
 
 # This deployment uses one firmware signing key. The key ID is immutable and is
-# referenced by signing requests and authorization policies below.
+# referenced by the signing URL and authorization policies below.
 [[Key]]
 ID = "microtun-firmware-prod"
 PEMPath = "/etc/microtun-firmware-signer/firmware-signing-key.encrypted.pem"
+# Pin the public-key fingerprint to the immutable key ID. The service verifies
+# this after decrypting the key and refuses to unlock a replacement key.
+Fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000" # replace this
 State = "active"
 # No passphrase credential is configured here. Active keys always start locked;
 # an operator must run microtun-firmware-signer unlock --key <key-id> after each service start.
