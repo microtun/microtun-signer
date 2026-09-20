@@ -79,8 +79,6 @@ pub struct KeyConfig {
     pub id: String,
     #[serde(rename = "PEMPath")]
     pub pem_path: PathBuf,
-    #[serde(rename = "Fingerprint")]
-    pub fingerprint: String,
     #[serde(rename = "State", default)]
     pub state: KeyState,
     // Accepted only to produce an explicit migration error. Key passphrases
@@ -281,11 +279,6 @@ impl Config {
             }
             if !key_ids.insert(key.id.as_str()) {
                 bail!("duplicate Key.ID {}", key.id);
-            }
-            if !valid_key_fingerprint(&key.fingerprint) {
-                bail!(
-                    "Key.Fingerprint must be sha256: followed by 64 lowercase hexadecimal characters"
-                );
             }
             if key.passphrase_credential.is_some() {
                 bail!(
@@ -559,16 +552,6 @@ pub fn valid_key_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn valid_key_fingerprint(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-}
-
 fn valid_identity_id(value: &str) -> bool {
     valid_key_id(value)
 }
@@ -641,7 +624,6 @@ Listen = "127.0.0.1:8080"
 [[Key]]
 ID = "test-key"
 PEMPath = "/tmp/test-key.pem"
-Fingerprint = "sha256:ddaf63cf52130558d20c3889805c7c737dbb1d26cef53553dc3dbf556924c5ca"
 
 [GitHub]
 OAuthClientID = "Iv1.test-client-id"

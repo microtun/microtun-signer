@@ -41,7 +41,6 @@ struct AuditRecord {
     success: bool,
     reason: String,
     key_id: Option<String>,
-    key_fingerprint: Option<String>,
     firmware_digest: Option<String>,
     identity_id: Option<String>,
     principal: Option<String>,
@@ -163,7 +162,6 @@ pub struct KeyResponse {
     id: String,
     state: &'static str,
     lock_state: &'static str,
-    fingerprint: String,
     public_key_pem: Option<String>,
 }
 
@@ -215,7 +213,6 @@ pub async fn get_key(
             None,
             AuditDetails {
                 key_id: Some(key.id()),
-                fingerprint: Some(key.fingerprint()),
                 ..AuditDetails::default()
             },
         ),
@@ -238,7 +235,6 @@ fn key_response(key: &KeyMaterial) -> KeyResponse {
         } else {
             "locked"
         },
-        fingerprint: key.fingerprint().to_owned(),
         public_key_pem: key.public_key_pem(),
     }
 }
@@ -356,25 +352,6 @@ pub async fn unlock_key(
                 &request_id,
             ));
         }
-        Err(UnlockError::FingerprintMismatch) => {
-            tracing::error!(
-                target: "microtun_firmware_signer::audit",
-                request_id = %request_id,
-                operation = "unlock-key",
-                success = false,
-                reason = "key-fingerprint-mismatch",
-                key_id = key.id(),
-                key_fingerprint = key.fingerprint(),
-                "firmware signer unlock audit event"
-            );
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "key-fingerprint-mismatch",
-                "Signing key fingerprint mismatch",
-                "The encrypted key does not match the fingerprint configured for this immutable key identifier.",
-                &request_id,
-            ));
-        }
         Err(UnlockError::LockPoisoned) => {
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -386,7 +363,6 @@ pub async fn unlock_key(
         }
     };
 
-    let fingerprint = key.fingerprint();
     tracing::info!(
         target: "microtun_firmware_signer::audit",
         request_id = %request_id,
@@ -394,7 +370,6 @@ pub async fn unlock_key(
         success = true,
         reason = if outcome == UnlockOutcome::AlreadyUnlocked { "already-unlocked" } else { "ok" },
         key_id = key.id(),
-        key_fingerprint = %fingerprint,
         "firmware signer unlock audit event"
     );
 
@@ -429,7 +404,6 @@ pub struct SignatureResponse {
 #[derive(Serialize)]
 struct SignatureResponseKey {
     id: String,
-    fingerprint: String,
 }
 
 pub async fn create_signature(
@@ -546,7 +520,6 @@ pub async fn create_signature(
             Some(&principal),
             AuditDetails {
                 key_id: Some(&key_id),
-                fingerprint: Some(key.fingerprint()),
                 firmware_digest: Some(&firmware_digest),
             },
         ),
@@ -555,10 +528,7 @@ pub async fn create_signature(
 
     Ok(Json(SignatureResponse {
         request_id: attempt_request_id,
-        key: SignatureResponseKey {
-            id: key_id,
-            fingerprint: key.fingerprint().to_owned(),
-        },
+        key: SignatureResponseKey { id: key_id },
         signature: BASE64.encode(signature),
     }))
 }
@@ -759,7 +729,6 @@ fn policy_denied_error() -> ApiError {
 #[derive(Default)]
 struct AuditDetails<'a> {
     key_id: Option<&'a str>,
-    fingerprint: Option<&'a str>,
     firmware_digest: Option<&'a str>,
 }
 
@@ -785,7 +754,6 @@ fn audit_record(
         success,
         reason: reason.to_owned(),
         key_id: details.key_id.map(str::to_owned),
-        key_fingerprint: details.fingerprint.map(str::to_owned),
         firmware_digest: details.firmware_digest.map(str::to_owned),
         identity_id: principal.map(|principal| principal.identity_id.clone()),
         principal: principal.map(|principal| principal.principal_key.clone()),
@@ -817,7 +785,6 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
         success = record.success,
         reason = %record.reason,
         key_id = record.key_id.as_deref().unwrap_or(""),
-        key_fingerprint = record.key_fingerprint.as_deref().unwrap_or(""),
         firmware_digest = record.firmware_digest.as_deref().unwrap_or(""),
         identity_id = record.identity_id.as_deref().unwrap_or(""),
         principal = record.principal.as_deref().unwrap_or(""),

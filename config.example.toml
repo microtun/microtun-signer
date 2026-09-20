@@ -23,9 +23,6 @@ SocketMode = 0o660
 [[Key]]
 ID = "microtun-firmware-prod"
 PEMPath = "/etc/microtun-firmware-signer/firmware-signing-key.encrypted.pem"
-# Pin the public-key fingerprint to the immutable key ID. The service verifies
-# this after decrypting the key and refuses to unlock a replacement key.
-Fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000" # replace this
 State = "active"
 # No passphrase credential is configured here. Active keys always start locked;
 # an operator must run microtun-firmware-signer unlock --key <key-id> after each service start.

@@ -85,7 +85,6 @@ struct UnlockResponse {
 struct UnlockKey {
     id: String,
     lock_state: String,
-    fingerprint: String,
 }
 
 #[derive(Deserialize)]
@@ -252,15 +251,14 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
     if unlocked.key.lock_state != "unlocked" {
         bail!("unlock API returned success but key is not unlocked");
     }
-    let fingerprint = unlocked.key.fingerprint;
     if unlocked.already_unlocked {
         println!(
-            "key {} was already unlocked ({fingerprint}); request {}",
+            "key {} was already unlocked; request {}",
             unlocked.key.id, unlocked.request_id
         );
     } else {
         println!(
-            "unlocked key {} ({fingerprint}); request {}",
+            "unlocked key {}; request {}",
             unlocked.key.id, unlocked.request_id
         );
     }

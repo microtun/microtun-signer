@@ -7,7 +7,6 @@ The signer keeps key custody separate from CI: callers authenticate with GitHub,
 ## Security model
 
 - Signing keys are encrypted PKCS#8 PEM files and always start **locked** after service startup.
-- Each immutable key ID is pinned to a configured SHA-256 public-key fingerprint. Unlocking fails if the encrypted key has been replaced with different key material.
 - Key passphrases are entered interactively through `microtun-firmware-signer unlock` and sent only over a local Unix-domain socket.
 - Human users authenticate through the signer's GitHub OAuth flow; GitHub Actions authenticates with GitHub OIDC. Raw GitHub OAuth tokens are not accepted by the signing API.
 - `[[Policy]]` entries bind named identities to allowed actions and key IDs.
@@ -25,15 +24,6 @@ cp config.example.toml config.toml
 ```
 
 Configure the GitHub identities, policies, OAuth application, and encrypted signing key in `config.toml`.
-
-Each key also needs its public-key fingerprint. One way to calculate it with OpenSSL is:
-
-```bash
-openssl pkey -in firmware-signing-key.encrypted.pem -pubout -outform DER \
-  | sha256sum
-```
-
-Set `Key.Fingerprint` to `sha256:<hex-output>`. The signer verifies this fingerprint every time the key is unlocked, preventing a key ID from silently being rebound to different key material.
 
 For local development, provide the OAuth client secret directly or via a file:
 
@@ -91,7 +81,7 @@ Human callers use the same minimal request body:
 }
 ```
 
-The signing body accepts no additional metadata: repository, ref, commit, workflow, algorithm, message type, encoding, key ID, and key fingerprint are all server-side or fixed by the endpoint contract.
+The signing body accepts no additional metadata: repository, ref, commit, workflow, algorithm, message type, encoding, and key ID are all server-side or fixed by the endpoint contract.
 
 A successful signing response is intentionally small:
 
@@ -99,14 +89,13 @@ A successful signing response is intentionally small:
 {
   "request_id": "01...",
   "key": {
-    "id": "microtun-firmware-prod",
-    "fingerprint": "sha256:..."
+    "id": "microtun-firmware-prod"
   },
   "signature": "<base64-ed25519-signature>"
 }
 ```
 
-`GET /v1/keys/{key_id}` returns the key ID, lifecycle state, lock state, pinned fingerprint, and the public key PEM when the key is unlocked.
+`GET /v1/keys/{key_id}` returns the key ID, lifecycle state, lock state, and the public key PEM when the key is unlocked.
 
 ## Development
 
