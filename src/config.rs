@@ -104,10 +104,10 @@ impl KeyState {
 
 /// GitHub OAuth application and REST API settings for human identities.
 ///
-/// The signer is the confidential OAuth client: it owns the client secret,
-/// performs the authorization-code exchange, resolves the authenticated user,
-/// and then issues its own short-lived bearer session. GitHub access tokens are
-/// never accepted directly by the signing API.
+/// The CLI performs GitHub's device flow as a public client. The signer keeps
+/// the OAuth client secret, verifies that the resulting GitHub token belongs to
+/// this exact OAuth App, revokes it, and issues its own short-lived bearer
+/// session. GitHub access tokens are never accepted directly by the signing API.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GithubConfig {
@@ -116,15 +116,15 @@ pub struct GithubConfig {
     #[serde(rename = "APIVersion", default = "default_github_api_version")]
     pub api_version: String,
     #[serde(
-        rename = "OAuthAuthorizeURL",
-        default = "default_github_oauth_authorize_url"
-    )]
-    pub oauth_authorize_url: String,
-    #[serde(
         rename = "OAuthAccessTokenURL",
         default = "default_github_oauth_access_token_url"
     )]
     pub oauth_access_token_url: String,
+    #[serde(
+        rename = "OAuthDeviceCodeURL",
+        default = "default_github_oauth_device_code_url"
+    )]
+    pub oauth_device_code_url: String,
     #[serde(rename = "OAuthClientID")]
     pub oauth_client_id: String,
     #[serde(
@@ -132,18 +132,11 @@ pub struct GithubConfig {
         default = "default_github_oauth_client_secret_credential"
     )]
     pub oauth_client_secret_credential: String,
-    #[serde(rename = "OAuthCallbackURL")]
-    pub oauth_callback_url: String,
     #[serde(
         rename = "OAuthSessionTTLSeconds",
         default = "default_oauth_session_ttl_seconds"
     )]
     pub oauth_session_ttl_seconds: u64,
-    #[serde(
-        rename = "OAuthStateTTLSeconds",
-        default = "default_oauth_state_ttl_seconds"
-    )]
-    pub oauth_state_ttl_seconds: u64,
 }
 
 /// GitHub Actions OIDC verifier infrastructure. Repository/workflow trust is
@@ -302,10 +295,13 @@ impl Config {
         if self.github.api_version.trim().is_empty() {
             bail!("GitHub.APIVersion must not be empty");
         }
-        validate_https_url("GitHub.OAuthAuthorizeURL", &self.github.oauth_authorize_url)?;
         validate_https_url(
             "GitHub.OAuthAccessTokenURL",
             &self.github.oauth_access_token_url,
+        )?;
+        validate_https_url(
+            "GitHub.OAuthDeviceCodeURL",
+            &self.github.oauth_device_code_url,
         )?;
         // The client ID is also interpolated into the token revocation URL.
         if !valid_key_id(&self.github.oauth_client_id) {
@@ -314,23 +310,12 @@ impl Config {
         if !valid_credential_name(&self.github.oauth_client_secret_credential) {
             bail!("GitHub.OAuthClientSecretCredential must match [A-Za-z0-9._-]{{1,128}}");
         }
-        let callback =
-            validate_https_url("GitHub.OAuthCallbackURL", &self.github.oauth_callback_url)?;
-        if callback.query().is_some() || callback.fragment().is_some() {
-            bail!("GitHub.OAuthCallbackURL must not contain a query string or fragment");
-        }
-        if callback.path() != "/v1/auth/github/callback" {
-            bail!("GitHub.OAuthCallbackURL path must be /v1/auth/github/callback");
-        }
         if self.github.oauth_session_ttl_seconds == 0
             || self.github.oauth_session_ttl_seconds > MAX_OAUTH_SESSION_TTL_SECONDS
         {
             bail!(
                 "GitHub.OAuthSessionTTLSeconds must be between 1 and {MAX_OAUTH_SESSION_TTL_SECONDS} seconds"
             );
-        }
-        if self.github.oauth_state_ttl_seconds == 0 || self.github.oauth_state_ttl_seconds > 600 {
-            bail!("GitHub.OAuthStateTTLSeconds must be between 1 and 600 seconds");
         }
 
         if self.github_actions.audience.trim().is_empty() {
@@ -630,12 +615,12 @@ fn default_github_api_version() -> String {
     "2026-03-10".to_owned()
 }
 
-fn default_github_oauth_authorize_url() -> String {
-    "https://github.com/login/oauth/authorize".to_owned()
-}
-
 fn default_github_oauth_access_token_url() -> String {
     "https://github.com/login/oauth/access_token".to_owned()
+}
+
+fn default_github_oauth_device_code_url() -> String {
+    "https://github.com/login/device/code".to_owned()
 }
 
 fn default_github_oauth_client_secret_credential() -> String {
@@ -644,10 +629,6 @@ fn default_github_oauth_client_secret_credential() -> String {
 
 const fn default_oauth_session_ttl_seconds() -> u64 {
     15 * 60
-}
-
-const fn default_oauth_state_ttl_seconds() -> u64 {
-    10 * 60
 }
 
 fn default_audience() -> String {
@@ -681,36 +662,12 @@ PEMPath = "/tmp/test-key.pem"
 
 [GitHub]
 OAuthClientID = "Iv1.test-client-id"
-OAuthCallbackURL = "https://signer.example/v1/auth/github/callback"
 
 [GitHubActions]
 
 {extra}
 "#
         )
-    }
-
-    #[test]
-    fn oauth_callback_must_use_root_api_path() {
-        let text = base_config(
-            r#"[[Identity]]
-ID = "maintainer"
-Type = "github-account"
-GitHubUserID = "42"
-
-[[Policy]]
-Identity = "maintainer"
-Actions = ["sign"]
-Keys = ["test-key"]
-"#,
-        )
-        .replace(
-            "https://signer.example/v1/auth/github/callback",
-            "https://signer.example/legacy-prefix/v1/auth/github/callback",
-        );
-        let mut config: Config = toml::from_str(&text).unwrap();
-        let error = config.normalize_and_validate().unwrap_err().to_string();
-        assert!(error.contains("must be /v1/auth/github/callback"));
     }
 
     #[test]

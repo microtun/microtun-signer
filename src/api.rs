@@ -1,33 +1,111 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA, SET_COOKIE, WWW_AUTHENTICATE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA, WWW_AUTHENTICATE},
     },
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::{
-    auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError, cookie_header},
+    auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError},
     authorization::Authorizer,
     config::{KeyState, PolicyAction, valid_key_id},
     key::{KeyRing, UnlockError, UnlockOutcome},
 };
 use zeroize::Zeroizing;
 
+const DEVICE_EXCHANGE_MAX_CONCURRENT: usize = 8;
+const DEVICE_EXCHANGE_RATE_LIMIT: usize = 10;
+const DEVICE_EXCHANGE_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_DEVICE_EXCHANGE_SOURCES: usize = 4096;
+
 #[derive(Clone)]
 pub struct AppState {
     pub keys: Arc<KeyRing>,
     pub auth: Authenticator,
     pub authz: Authorizer,
+    device_exchange_limiter: Arc<DeviceExchangeLimiter>,
+}
+
+impl AppState {
+    pub fn new(keys: Arc<KeyRing>, auth: Authenticator, authz: Authorizer) -> Self {
+        Self {
+            keys,
+            auth,
+            authz,
+            device_exchange_limiter: Arc::new(DeviceExchangeLimiter::new()),
+        }
+    }
+}
+
+struct DeviceExchangeLimiter {
+    permits: Arc<Semaphore>,
+    attempts: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceExchangeLimitError {
+    RateLimited,
+    Busy,
+}
+
+impl DeviceExchangeLimiter {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(DEVICE_EXCHANGE_MAX_CONCURRENT)),
+            attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn admit(
+        &self,
+        source: IpAddr,
+    ) -> Result<OwnedSemaphorePermit, DeviceExchangeLimitError> {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(DEVICE_EXCHANGE_RATE_WINDOW).unwrap_or(now);
+        let mut attempts = self.attempts.lock().await;
+
+        if attempts.len() >= MAX_DEVICE_EXCHANGE_SOURCES && !attempts.contains_key(&source) {
+            attempts.retain(|_, entries| {
+                while entries.front().is_some_and(|attempt| *attempt <= cutoff) {
+                    entries.pop_front();
+                }
+                !entries.is_empty()
+            });
+            if attempts.len() >= MAX_DEVICE_EXCHANGE_SOURCES {
+                return Err(DeviceExchangeLimitError::RateLimited);
+            }
+        }
+
+        let entries = attempts.entry(source).or_default();
+        while entries.front().is_some_and(|attempt| *attempt <= cutoff) {
+            entries.pop_front();
+        }
+        if entries.len() >= DEVICE_EXCHANGE_RATE_LIMIT {
+            return Err(DeviceExchangeLimitError::RateLimited);
+        }
+        entries.push_back(now);
+        drop(attempts);
+
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DeviceExchangeLimitError::Busy)
+    }
 }
 
 /// State for the local-only admin API served on the Unix-domain socket.
@@ -84,95 +162,104 @@ pub async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GithubOAuthCallbackQuery {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
-}
-
 #[derive(Serialize)]
 struct OAuthSessionResponse {
     access_token: String,
     expires_in: u64,
 }
 
-/// Redirect a human user to GitHub to authorize this signer OAuth application.
-/// The flow is bound to this browser with an authenticated `__Host-` cookie
-/// and to this signer with PKCE; no server-side state is created.
-pub async fn github_oauth_login(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let request_id = Ulid::new().to_string();
-    let start = state
-        .auth
-        .github_oauth_start()
-        .map_err(|error| oauth_flow_error(error, &request_id))?;
-    let mut response = Redirect::temporary(&start.authorize_url).into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&start.set_cookie).expect("cookie is ASCII"),
-    );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(response)
+#[derive(Serialize)]
+struct OAuthDeviceConfigResponse {
+    client_id: String,
+    device_code_url: String,
+    access_token_url: String,
+    scope: &'static str,
 }
 
-/// GitHub OAuth callback. The signer verifies the browser-bound state,
-/// exchanges the one-time GitHub code with its client secret and PKCE
-/// verifier, requires the account to have 2FA enabled, revokes the GitHub
-/// token, and mints a short-lived signer-local bearer credential.
-pub async fn github_oauth_callback(
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthDeviceExchangeRequest {
+    access_token: String,
+}
+
+/// Return the public OAuth parameters a CLI needs for GitHub's device flow.
+/// No secret is exposed here: OAuth client IDs and the GitHub endpoints are
+/// public, while the client secret remains in the signer process.
+pub async fn github_oauth_device_config(State(state): State<AppState>) -> Response {
+    let config = state.auth.github_oauth_device_config();
+    let mut response = Json(OAuthDeviceConfigResponse {
+        client_id: config.client_id,
+        device_code_url: config.device_code_url,
+        access_token_url: config.access_token_url,
+        scope: config.scope,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Convert a GitHub device-flow token into a short-lived signer-local session.
+/// The endpoint is source-rate-limited and globally concurrency-bounded before
+/// it can cause authenticated requests from the signer to GitHub.
+pub async fn github_oauth_device_exchange(
     State(state): State<AppState>,
-    Query(query): Query<GithubOAuthCallbackQuery>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Response {
+    body: Bytes,
+) -> Result<Response, ApiError> {
     let request_id = Ulid::new().to_string();
-    let result = complete_oauth_callback(&state, &query, &headers).await;
-    let mut response = match result {
-        Ok(grant) => Json(OAuthSessionResponse {
-            access_token: grant.access_token,
-            expires_in: grant.expires_in,
-        })
-        .into_response(),
-        Err(error) => {
+    let _admission = state
+        .device_exchange_limiter
+        .admit(peer.ip())
+        .await
+        .map_err(|error| device_exchange_limit_error(error, &request_id))?;
+    if !is_json_content_type(&headers) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-type",
+            "Unsupported content type",
+            "GitHub device-token exchanges must use Content-Type: application/json.",
+            &request_id,
+        ));
+    }
+
+    let request: OAuthDeviceExchangeRequest = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed-json",
+            "Malformed GitHub device-token exchange",
+            "The request body must contain exactly one string field named access_token.",
+            &request_id,
+        )
+    })?;
+    let access_token = Zeroizing::new(request.access_token);
+    let grant = state
+        .auth
+        .complete_github_device_oauth(access_token.as_str())
+        .await
+        .map_err(|error| {
             tracing::warn!(
                 target: "microtun_firmware_signer::audit",
                 request_id = %request_id,
-                operation = "oauth-login",
+                operation = "oauth-device-login",
                 success = false,
                 reason = %error,
                 "firmware signer login audit event"
             );
-            oauth_flow_error(error, &request_id).into_response()
-        }
-    };
+            oauth_flow_error(error, &request_id)
+        })?;
+
+    let mut response = Json(OAuthSessionResponse {
+        access_token: grant.access_token,
+        expires_in: grant.expires_in,
+    })
+    .into_response();
     let headers = response.headers_mut();
-    // The flow cookie is single-purpose; drop it whatever the outcome.
-    headers.insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&Authenticator::oauth_clear_cookie()).expect("cookie is ASCII"),
-    );
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
-    response
-}
-
-async fn complete_oauth_callback(
-    state: &AppState,
-    query: &GithubOAuthCallbackQuery,
-    headers: &HeaderMap,
-) -> Result<crate::auth::OAuthSessionGrant, OAuthFlowError> {
-    if query.error.is_some() {
-        return Err(OAuthFlowError::AuthorizationDenied);
-    }
-    let code = query
-        .code
-        .as_deref()
-        .ok_or(OAuthFlowError::AuthorizationDenied)?;
-    let oauth_state = query.state.as_deref().ok_or(OAuthFlowError::InvalidState)?;
-    state
-        .auth
-        .complete_github_oauth(code, oauth_state, cookie_header(headers))
-        .await
+    Ok(response)
 }
 
 pub async fn get_public_key(
@@ -636,25 +723,25 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
 
 fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
     match error {
-        OAuthFlowError::InvalidState => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "oauth-state-invalid",
-            "GitHub OAuth state is invalid or expired",
-            "Restart the GitHub login flow in the same browser and try again.",
-            request_id,
-        ),
-        OAuthFlowError::AuthorizationDenied => ApiError::new(
+        OAuthFlowError::TokenValidationFailed => ApiError::new(
             StatusCode::UNAUTHORIZED,
-            "oauth-authorization-denied",
-            "GitHub authorization was not completed",
-            "GitHub did not return a usable authorization code.",
+            "oauth-token-invalid",
+            "GitHub OAuth token is invalid",
+            "The token is invalid or was not issued to this signer's GitHub OAuth application.",
             request_id,
         ),
-        OAuthFlowError::ExchangeFailed => ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "oauth-code-exchange-failed",
-            "GitHub OAuth code exchange failed",
-            "The signer could not exchange the GitHub authorization code.",
+        OAuthFlowError::TokenReplayed => ApiError::new(
+            StatusCode::CONFLICT,
+            "oauth-token-replayed",
+            "GitHub OAuth token has already been used",
+            "Start a new GitHub device authorization and try again.",
+            request_id,
+        ),
+        OAuthFlowError::ReplayCacheUnavailable => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth-replay-cache-unavailable",
+            "GitHub OAuth login is temporarily unavailable",
+            "The signer cannot safely record the one-time bootstrap token.",
             request_id,
         ),
         OAuthFlowError::ScopeNotGranted => ApiError::new(
@@ -669,6 +756,13 @@ fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
             "identity-provider-unavailable",
             "GitHub identity verification is temporarily unavailable",
             "The signer could not complete GitHub OAuth authentication.",
+            request_id,
+        ),
+        OAuthFlowError::TokenRevocationFailed => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth-token-revocation-failed",
+            "GitHub OAuth token revocation failed",
+            "The signer will not issue a local session until the GitHub bootstrap token is revoked.",
             request_id,
         ),
         OAuthFlowError::ClaimsDenied => ApiError::new(
@@ -690,6 +784,25 @@ fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
             "oauth-capacity-exhausted",
             "GitHub OAuth login is temporarily unavailable",
             "The signer has reached its temporary OAuth session capacity.",
+            request_id,
+        ),
+    }
+}
+
+fn device_exchange_limit_error(error: DeviceExchangeLimitError, request_id: &str) -> ApiError {
+    match error {
+        DeviceExchangeLimitError::RateLimited => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "oauth-device-rate-limited",
+            "Too many GitHub device-token exchanges",
+            "Wait before attempting another GitHub device-token exchange from this source.",
+            request_id,
+        ),
+        DeviceExchangeLimitError::Busy => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth-device-busy",
+            "GitHub device-token exchange is busy",
+            "The signer is already processing the maximum number of GitHub device-token exchanges.",
             request_id,
         ),
     }
@@ -909,6 +1022,44 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::auth::{AuthSource, GithubAccountIdentity, GithubActionsIdentity};
+
+    #[test]
+    fn oauth_device_exchange_accepts_only_access_token() {
+        let request: OAuthDeviceExchangeRequest =
+            serde_json::from_str(r#"{"access_token":"gho_test"}"#).unwrap();
+        assert_eq!(request.access_token, "gho_test");
+        let with_extra = r#"{"access_token":"gho_test","unexpected":"x"}"#;
+        assert!(serde_json::from_str::<OAuthDeviceExchangeRequest>(with_extra).is_err());
+    }
+
+    #[tokio::test]
+    async fn device_exchange_rate_limiter_caps_each_peer() {
+        let limiter = DeviceExchangeLimiter::new();
+        let source: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..DEVICE_EXCHANGE_RATE_LIMIT {
+            drop(limiter.admit(source).await.unwrap());
+        }
+        assert_eq!(
+            limiter.admit(source).await.unwrap_err(),
+            DeviceExchangeLimitError::RateLimited
+        );
+    }
+
+    #[tokio::test]
+    async fn device_exchange_limiter_rejects_excess_concurrency() {
+        let limiter = DeviceExchangeLimiter::new();
+        let source: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..DEVICE_EXCHANGE_MAX_CONCURRENT {
+            permits.push(limiter.admit(source).await.unwrap());
+        }
+        assert_eq!(
+            limiter.admit(source).await.unwrap_err(),
+            DeviceExchangeLimitError::Busy
+        );
+        permits.pop();
+        assert!(limiter.admit(source).await.is_ok());
+    }
 
     #[test]
     fn signing_request_accepts_only_digest() {

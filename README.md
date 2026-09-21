@@ -2,34 +2,20 @@
 
 A small Rust service for signing MCUboot SHA-256 firmware digests with encrypted Ed25519 keys.
 
-The signer keeps key custody separate from CI: callers authenticate with GitHub, authorization is defined explicitly in TOML, and signing keys are only decrypted in memory after a local operator unlocks them.
-
-## Security model
-
-- Signing keys are encrypted PKCS#8 PEM files and always start **locked** after service startup. Key files must use PBES2 with AES-256 and either scrypt (r ≥ 8, N·p ≥ 2^17) or PBKDF2-HMAC-SHA-256/512 with at least 600,000 iterations; weaker files are refused at startup.
-- Key and secret files are opened without following symlinks and validated on the open file descriptor: regular file, owned by root or the service user, no group write and no access for other users.
-- Key passphrases are entered interactively through `microtun-firmware-signer unlock` and sent only over a local Unix-domain socket. Decryption runs on the blocking thread pool, one key at a time, so an expensive KDF never stalls request handling. The socket belongs to a dedicated operators group (`Server.AdminSocketGroup`) that cannot read the key file or service configuration.
-- Human users authenticate through the signer's GitHub OAuth flow; GitHub Actions authenticates with GitHub OIDC. Raw GitHub OAuth tokens are not accepted by the signing API.
-- `[[Policy]]` entries bind named identities to allowed actions and key IDs.
-- GitHub Actions signing requires a tag protected by a GitHub ruleset (the `ref_protected` claim) and a job running in the identity's `RequiredEnvironment`. Configure that environment's deployment rules to allow only protected tags. Repository, commit, ref, workflow, event, run ID, and run attempt come directly from the verified OIDC token; clients do not echo that provenance in the request body.
-- Each GitHub Actions OIDC token can be used for one request (`jti` replay protection). Mint a fresh token per signing request.
-- JWKS refreshes are single-flight and triggered by an unknown `kid` at most once a minute; previously fetched keys stay usable for up to 24 hours if GitHub is unreachable.
-- Human OAuth uses PKCE and a browser-bound, HMAC-authenticated `__Host-` state cookie; no login state is stored server-side. The signer requests `read:user`, refuses accounts without GitHub two-factor authentication, and revokes the GitHub token immediately after resolving the account.
-- Human sessions are short-lived (15 minutes by default, 1 hour maximum) and are stored only as SHA-256 hashes in process memory, so restarting the signer invalidates all active human sessions. Human OAuth sessions are trusted signers: signing requests contain no caller-supplied release or GitHub provenance metadata.
-- The TCP listener must be a loopback address unless `Server.AllowNonLoopbackListen = true`. Terminate TLS at a trusted reverse proxy. Never expose or proxy the admin socket.
-
 ## Build and run
 
-Requires Rust 1.85+.
+Requires Rust 1.98+.
 
 ```bash
 cargo build --release --locked
 cp config.example.toml config.toml
 ```
 
-Configure the GitHub identities, policies, OAuth application, and encrypted signing key in `config.toml`.
+Configure the GitHub identities and policies, GitHub OAuth application, GitHub Actions OIDC verifier, server settings, and encrypted signing key in `config.toml`. Running the binary without a subcommand starts the service; the default config path is `/etc/microtun-firmware-signer/config.toml`, and `--config`/`MICROTUN_SIGNER_CONFIG` overrides it.
 
-Encrypt the signing key with a strong KDF, for example:
+The public listener speaks plain HTTP. By default the signer refuses a non-loopback `Server.Listen`; terminate TLS at a trusted reverse proxy/load balancer, or explicitly set `Server.AllowNonLoopbackListen = true` only when the network path is otherwise protected.
+
+Signing keys must be encrypted PKCS#8 using PBES2 with AES-256-CBC and either scrypt (`r >= 8` and `N*p >= 2^17`) or PBKDF2-HMAC-SHA-256/512 with at least 600,000 iterations. For example:
 
 ```bash
 openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
@@ -54,7 +40,7 @@ CREDENTIALS_DIRECTORY="$PWD/dev-credentials" \
   ./target/release/microtun-firmware-signer --config ./config.toml
 ```
 
-Active keys must be unlocked after every service start:
+All keys start locked on service startup, and only keys with `State = "active"` can be unlocked. Unlock active keys interactively after each service start:
 
 ```bash
 ./target/release/microtun-firmware-signer --config ./config.toml \
@@ -65,9 +51,21 @@ Active keys must be unlocked after every service start:
   unlock -k microtun-firmware-prod
 ```
 
-CLI short options are `-c` for `--config`, `-k` for `--key-id`, `-s` for `--socket`, `-u` for `--url`, and `-d` for `--digest`. The `unlock` subcommand uses the default admin socket path and only reads the config when `--config` (or `MICROTUN_SIGNER_CONFIG`) is given explicitly.
+The unlock passphrase is read from the terminal with hidden input; it is not accepted as a command-line argument, environment variable, or systemd credential. CLI short options are `-c` for `--config`, `-k` for `--key-id`, `-s` for `--socket`, `-u` for `--url`, and `-d` for `--digest`. `MICROTUN_SIGNER_ADMIN_SOCKET` may be used instead of `--socket`. The `unlock` subcommand uses the default admin socket path and only reads the service config when `--config` (or `MICROTUN_SIGNER_CONFIG`) is given explicitly.
 
-The binary can also act as a client for the public signing API. Pass the bearer credential through `MICROTUN_SIGNER_TOKEN` to avoid putting it in the process arguments:
+The binary can also act as a client for the public signing API. Human GitHub users authenticate explicitly with `--github-device`; the command starts GitHub's OAuth device flow, prints the verification URL/code to stderr, exchanges the resulting GitHub token for a short-lived signer-local session, and then performs the signing request:
+
+```bash
+./target/release/microtun-firmware-signer sign \
+  --github-device \
+  --url https://signer.example.com/ \
+  --key-id microtun-firmware-prod \
+  --digest "$DIGEST_BASE64"
+```
+
+Enable **Device Flow** in the GitHub OAuth App settings. `--github-device` takes precedence over `MICROTUN_SIGNER_TOKEN`/`--token`. Without either an explicit bearer credential or `--github-device`, `sign` fails instead of unexpectedly becoming interactive. The CLI never receives the OAuth client secret. The signer verifies that the temporary GitHub token was issued to its configured OAuth App, requires a configured account with 2FA, revokes the GitHub token, and only then returns a short-lived signer-local session. RFC 8628 device authorization and the polling loop are handled by the `oauth2` crate, with the CLI preserving GitHub's required wait before the first token poll and normalizing GitHub's HTTP-200 OAuth error responses for the crate; GitHub-specific token verification, identity policy, replay protection, and revocation remain signer-side.
+
+Automation can continue to pass an existing bearer credential through `MICROTUN_SIGNER_TOKEN` to avoid putting it in process arguments:
 
 ```bash
 MICROTUN_SIGNER_TOKEN="$TOKEN" \
@@ -77,25 +75,27 @@ MICROTUN_SIGNER_TOKEN="$TOKEN" \
   --digest "$DIGEST_BASE64"
 ```
 
-`MICROTUN_SIGNER_URL` may be used instead of `--url`. On success, `sign` writes only the base64 Ed25519 signature to stdout, which makes it suitable for scripts.
+`MICROTUN_SIGNER_URL` may be used instead of `--url`. The bearer credential can be a signer-local human session or a GitHub Actions OIDC JWT that satisfies the configured identity constraints. On success, `sign` writes only the base64 Ed25519 signature to stdout; device-flow instructions are written to stderr, so stdout remains suitable for scripts.
 
-On Debian/systemd deployments, use the packaged systemd credential for the GitHub OAuth client secret; the example unit and `debian/README.Debian` document the expected layout.
+On Debian/systemd deployments, use the packaged systemd credential for the GitHub OAuth client secret; the example unit and `debian/README.Debian` document the expected layout and operator-group setup.
 
 ## HTTP API
 
-The public API has five endpoints:
+The public API has five paths:
 
 ```text
 GET  /healthz
-GET  /v1/auth/github
-GET  /v1/auth/github/callback
+GET  /v1/auth/github/device
+POST /v1/auth/github/device
 GET  /v1/public-key/{key_id}
 POST /v1/sign/{key_id}
 ```
 
 `GET /healthz` returns `204 No Content` when the process is serving requests.
 
-Human users start authentication at `GET /v1/auth/github` in a browser; the callback must complete in the same browser. The callback returns only the signer-local bearer credential and its lifetime:
+Human users authenticate through the CLI device flow. `GET /v1/auth/github/device` returns only the public OAuth client ID, device-code URL, access-token URL, and requested scope. After GitHub authorizes the CLI, `POST /v1/auth/github/device` accepts the temporary GitHub access token, verifies with the OAuth client secret that the token belongs to this exact OAuth App, rejects replay, resolves the configured account, requires 2FA, and revokes the GitHub token before minting a signer-local session.
+
+The exchange endpoint is limited to 10 attempts per 60 seconds per TCP peer and at most 8 concurrent exchanges. It deliberately uses the direct TCP peer address rather than trusting forwarding headers; behind a reverse proxy, clients therefore share the proxy's per-peer quota unless the deployment terminates the public listener differently. GitHub token revocation is fail-closed: if revocation cannot be confirmed, no signer-local session is issued. A successful exchange returns only the signer-local bearer credential and its lifetime:
 
 ```json
 {
@@ -131,18 +131,21 @@ Errors use the HTTP status plus a compact body for programmatic handling and aud
 }
 ```
 
-For GitHub Actions callers, repository, commit, ref, actor, workflow, event, run ID, and run attempt come directly from the verified OIDC token and are recorded in the audit log. Actions signing still requires an authenticated tag ref. Human OAuth sessions use the same signing request body and do not supply release provenance.
+For GitHub Actions callers, the bearer token is a GitHub Actions OIDC JWT. Repository, commit, ref, protected-ref status, actor, workflow, environment, event, run ID, and run attempt come from the verified token and are recorded in the audit log. Tokens must resolve unambiguously to a configured `github-actions` identity and are single-use within the signer process via their OIDC `jti`.
 
-Key unlock is an admin operation only, available over the Unix-domain socket configured by `Server.AdminSocketPath`/`Server.AdminSocketMode`/`Server.AdminSocketGroup` at `POST /v1/unlock/{key_id}`. It returns `204 No Content` on success. Restarting the service invalidates all signer-local human OAuth sessions because those sessions exist only in process memory.
+Signing from GitHub Actions requires an authenticated tag ref that GitHub reports as protected by a ruleset. Any `github-actions` identity granted the `sign` action must also configure `WorkflowPath`, `AllowedEventNames`, and `RequiredEnvironment`; the example configuration shows the intended protected-environment setup. Human OAuth sessions use the same signing request body but do not have release-provenance requirements.
+
+Key unlock is an admin operation only, available over the Unix-domain socket configured by `Server.AdminSocketPath`/`Server.AdminSocketMode`/`Server.AdminSocketGroup` at `POST /v1/unlock/{key_id}`. It returns `204 No Content` on success. Restarting the service relocks every key and invalidates all signer-local human OAuth sessions because both are held only in process memory.
 
 ## Development
 
 ```bash
 cargo fmt --all -- --check
+cargo check --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
-Debian packages can be built with `Dockerfile.debian`; CI publishes amd64 and arm64 `.deb` artifacts for tagged releases.
+Debian packages can be built with `Dockerfile.debian`; tagged releases publish amd64 and arm64 `.deb` artifacts.
 
-Release tags must use canonical `vX.Y.Z` SemVer syntax and must exactly match the `[package].version` in `Cargo.toml`; CI checks this before release artifacts are built or published.
+Release tags must use canonical `vX.Y.Z` SemVer syntax, must exactly match both `[package].version` in `Cargo.toml` and the top version in `debian/changelog`, and must point to a commit contained in `main`; CI checks these conditions before release artifacts are published.

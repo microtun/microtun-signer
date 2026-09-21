@@ -37,27 +37,24 @@ State = "active"
 # No passphrase credential is configured here. Active keys always start locked;
 # an operator must run microtun-firmware-signer unlock --key-id <key-id> after each service start.
 
-# Human identities authenticate through THIS signer's GitHub OAuth App.
-# Register an OAuth App in GitHub and set its Authorization callback URL to the
-# exact OAuthCallbackURL below. Keep the client secret outside this TOML file;
-# the service reads it only from the systemd credential named below
-# ($CREDENTIALS_DIRECTORY/<name>).
+# Human identities authenticate through THIS signer's GitHub OAuth App using
+# GitHub's device flow. Enable Device Flow in the OAuth App settings. Keep the
+# client secret outside this TOML file; the service reads it only from the
+# systemd credential named below ($CREDENTIALS_DIRECTORY/<name>).
 #
-# The signer requests the read:user scope so GitHub reports whether the account
-# has two-factor authentication enabled; accounts without 2FA are refused. The
-# GitHub token is revoked immediately after the lookup.
+# The CLI requests read:user so GitHub reports whether the account has 2FA. The
+# signer verifies that the temporary token belongs to this exact OAuth App and
+# revokes it before issuing a short-lived signer-local session.
 [GitHub]
 APIURL = "https://api.github.com"
 APIVersion = "2026-03-10"
-OAuthAuthorizeURL = "https://github.com/login/oauth/authorize"
 OAuthAccessTokenURL = "https://github.com/login/oauth/access_token"
+OAuthDeviceCodeURL = "https://github.com/login/device/code"
 OAuthClientID = "Ov23liEXAMPLE"
 OAuthClientSecretCredential = "github-oauth-client-secret"
-OAuthCallbackURL = "https://signer.example.com/v1/auth/github/callback"
 # Human sessions sign without build provenance, so keep them short
 # (default 900, maximum 3600).
 OAuthSessionTTLSeconds = 900
-OAuthStateTTLSeconds = 600
 
 # GitHub Actions OIDC verifier infrastructure. Repository/workflow trust belongs
 # to the github-actions Identity below, not to this verifier block.
