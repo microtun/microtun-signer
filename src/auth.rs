@@ -170,9 +170,6 @@ pub struct AuthPrincipal {
 pub struct OAuthSessionGrant {
     pub access_token: String,
     pub expires_in: u64,
-    pub identity_id: String,
-    pub user_id: String,
-    pub login: String,
 }
 
 #[derive(Debug, Error)]
@@ -357,9 +354,6 @@ impl Authenticator {
         Ok(OAuthSessionGrant {
             access_token,
             expires_in,
-            identity_id: identity.id.clone(),
-            user_id,
-            login: user.login,
         })
     }
 

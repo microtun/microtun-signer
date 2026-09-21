@@ -1,4 +1,10 @@
-microtun-firmware-signer (0.3.1) UNRELEASED; urgency=medium
+microtun-firmware-signer (0.4.0) UNRELEASED; urgency=medium
+
+  * Reduce the HTTP API to the essential auth and signing operations
+
+ -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 23:15:00 +0200
+
+microtun-firmware-signer (0.3.1) unstable; urgency=medium
 
   * Systemd credentials use ACLs instead of file mod
 

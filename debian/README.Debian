@@ -17,8 +17,8 @@ and are not accessible by other users.
 
 Signing-key passphrases are intentionally not systemd credentials. Every active
 key starts locked after service startup. The packaged unit creates
-/run/microtun-firmware-signer and the service exposes its unlock management API
-at /run/microtun-firmware-signer/unlock.sock. The socket defaults to mode 0660.
+/run/microtun-firmware-signer and the service exposes its local admin API
+at /run/microtun-firmware-signer/admin.sock. The socket defaults to mode 0660.
 Operators who need to unlock keys should be granted access to the service group,
 or invoke the unlock subcommand as an appropriately privileged user:
 

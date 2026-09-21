@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     api::{
-        AppState, UnlockState, create_signature, get_key, github_oauth_callback,
+        AppState, UnlockState, create_signature, get_public_key, github_oauth_callback,
         github_oauth_login, health, unlock_key,
     },
     auth::Authenticator,
@@ -41,6 +41,7 @@ use crate::{
 struct Cli {
     /// Path to the service TOML configuration.
     #[arg(
+        short = 'c',
         long,
         env = "MICROTUN_SIGNER_CONFIG",
         global = true,
@@ -61,11 +62,11 @@ enum Commands {
 #[derive(Debug, clap::Args)]
 struct UnlockArgs {
     /// Immutable signing key ID to unlock.
-    #[arg(long)]
+    #[arg(short = 'k', long)]
     key: String,
 
-    /// Unix-domain socket exposed by the signer's local unlock API.
-    #[arg(long, env = "MICROTUN_SIGNER_UNLOCK_SOCKET")]
+    /// Unix-domain socket exposed by the signer's local admin API.
+    #[arg(short = 's', long, env = "MICROTUN_SIGNER_ADMIN_SOCKET")]
     socket: Option<PathBuf>,
 }
 
@@ -75,22 +76,8 @@ struct UnlockRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct UnlockResponse {
-    request_id: String,
-    already_unlocked: bool,
-    key: UnlockKey,
-}
-
-#[derive(Deserialize)]
-struct UnlockKey {
-    id: String,
-    lock_state: String,
-}
-
-#[derive(Deserialize)]
-struct ProblemBody {
-    title: String,
-    detail: String,
+struct ErrorBody {
+    error: String,
     request_id: String,
 }
 
@@ -137,19 +124,19 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(health))
-        .route("/v1/auth/github/login", get(github_oauth_login))
+        .route("/v1/auth/github", get(github_oauth_login))
         .route("/v1/auth/github/callback", get(github_oauth_callback))
-        .route("/v1/keys/{key_id}", get(get_key))
-        .route("/v1/keys/{key_id}/signatures", post(create_signature))
+        .route("/v1/public-key/{key_id}", get(get_public_key))
+        .route("/v1/sign/{key_id}", post(create_signature))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // The unlock API deliberately lives on a separate Unix-domain socket. It
+    // The admin API deliberately lives on a separate Unix-domain socket. It
     // must never be added to the public TCP router or reverse-proxied.
-    let unlock_app = Router::new()
-        .route("/v1/keys/{key_id}/unlock", post(unlock_key))
+    let admin_app = Router::new()
+        .route("/v1/unlock/{key_id}", post(unlock_key))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -158,18 +145,20 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .with_context(|| format!("failed to bind {}", config.server.listen))?;
-    let unlock_listener =
-        bind_unlock_socket(&config.unlock.socket_path, config.unlock.socket_mode)?;
-    let _unlock_socket_guard = UnlockSocketGuard(config.unlock.socket_path.clone());
+    let admin_listener = bind_admin_socket(
+        &config.server.admin_socket_path,
+        config.server.admin_socket_mode,
+    )?;
+    let _admin_socket_guard = AdminSocketGuard(config.server.admin_socket_path.clone());
 
     tracing::info!(
         listen = %config.server.listen,
         "firmware signing service started"
     );
     tracing::info!(
-        socket = %config.unlock.socket_path.display(),
-        mode = %format_args!("{:03o}", config.unlock.socket_mode),
-        "local key unlock API started"
+        socket = %config.server.admin_socket_path.display(),
+        mode = %format_args!("{:03o}", config.server.admin_socket_mode),
+        "local admin API started"
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -180,10 +169,10 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     let public_server =
         axum::serve(listener, app).with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
-    let unlock_server = axum::serve(unlock_listener, unlock_app)
+    let admin_server = axum::serve(admin_listener, admin_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
 
-    tokio::try_join!(public_server, unlock_server).context("HTTP server failed")?;
+    tokio::try_join!(public_server, admin_server).context("HTTP server failed")?;
     Ok(())
 }
 
@@ -194,13 +183,16 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
 
     let socket = match args.socket {
         Some(socket) => socket,
-        None => Config::load(config_path)?.unlock.socket_path,
+        None => Config::load(config_path)?.server.admin_socket_path,
     };
 
     let socket_metadata = fs::metadata(&socket)
-        .with_context(|| format!("unlock socket {} is not available", socket.display()))?;
+        .with_context(|| format!("admin socket {} is not available", socket.display()))?;
     if !socket_metadata.file_type().is_socket() {
-        bail!("unlock path {} is not a Unix socket", socket.display());
+        bail!(
+            "admin socket path {} is not a Unix socket",
+            socket.display()
+        );
     }
 
     let prompt = format!("Passphrase for firmware signing key {}:", args.key);
@@ -213,8 +205,8 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
         .unix_socket(socket.as_path())
         .timeout(Duration::from_secs(30))
         .build()
-        .context("failed to create unlock API client")?;
-    let url = format!("http://localhost/v1/keys/{}/unlock", args.key);
+        .context("failed to create admin API client")?;
+    let url = format!("http://localhost/v1/unlock/{}", args.key);
     let response = client
         .post(url)
         .json(&UnlockRequest {
@@ -224,44 +216,28 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
         .await
         .with_context(|| {
             format!(
-                "failed to call unlock API over Unix socket {}",
+                "failed to call admin API over Unix socket {}",
                 socket.display()
             )
         })?;
 
     let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .context("failed to read unlock API response")?;
     if !status.is_success() {
-        if let Ok(problem) = serde_json::from_slice::<ProblemBody>(&body) {
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read admin API response")?;
+        if let Ok(problem) = serde_json::from_slice::<ErrorBody>(&body) {
             bail!(
-                "unlock failed: {}: {} (request {})",
-                problem.title,
-                problem.detail,
+                "unlock failed: {} (request {})",
+                problem.error,
                 problem.request_id
             );
         }
         bail!("unlock failed with HTTP status {status}");
     }
 
-    let unlocked: UnlockResponse =
-        serde_json::from_slice(&body).context("unlock API returned an invalid success response")?;
-    if unlocked.key.lock_state != "unlocked" {
-        bail!("unlock API returned success but key is not unlocked");
-    }
-    if unlocked.already_unlocked {
-        println!(
-            "key {} was already unlocked; request {}",
-            unlocked.key.id, unlocked.request_id
-        );
-    } else {
-        println!(
-            "unlocked key {}; request {}",
-            unlocked.key.id, unlocked.request_id
-        );
-    }
+    println!("key {} is unlocked", args.key);
     Ok(())
 }
 
@@ -279,29 +255,29 @@ fn valid_key_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn bind_unlock_socket(path: &Path, mode: u32) -> Result<tokio::net::UnixListener> {
+fn bind_admin_socket(path: &Path, mode: u32) -> Result<tokio::net::UnixListener> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(
-            "unlock socket path {} has no parent directory",
+            "admin socket path {} has no parent directory",
             path.display()
         )
     })?;
     let parent_metadata = fs::metadata(parent).with_context(|| {
         format!(
-            "failed to stat unlock socket parent directory {}",
+            "failed to stat admin socket parent directory {}",
             parent.display()
         )
     })?;
     if !parent_metadata.is_dir() {
         bail!(
-            "unlock socket parent {} is not a directory",
+            "admin socket parent {} is not a directory",
             parent.display()
         );
     }
     let parent_mode = parent_metadata.permissions().mode() & 0o777;
     if parent_mode & 0o022 != 0 {
         bail!(
-            "unlock socket parent {} must not be writable by group/other users (mode {:03o})",
+            "admin socket parent {} must not be writable by group/other users (mode {:03o})",
             parent.display(),
             parent_mode
         );
@@ -310,28 +286,28 @@ fn bind_unlock_socket(path: &Path, mode: u32) -> Result<tokio::net::UnixListener
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.file_type().is_socket() {
             bail!(
-                "refusing to replace non-socket unlock path {}",
+                "refusing to replace non-socket admin path {}",
                 path.display()
             );
         }
         fs::remove_file(path)
-            .with_context(|| format!("failed to remove stale unlock socket {}", path.display()))?;
+            .with_context(|| format!("failed to remove stale admin socket {}", path.display()))?;
     }
 
     let listener = tokio::net::UnixListener::bind(path)
-        .with_context(|| format!("failed to bind unlock socket {}", path.display()))?;
+        .with_context(|| format!("failed to bind admin socket {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
         format!(
-            "failed to set unlock socket permissions on {}",
+            "failed to set admin socket permissions on {}",
             path.display()
         )
     })?;
     Ok(listener)
 }
 
-struct UnlockSocketGuard(PathBuf);
+struct AdminSocketGuard(PathBuf);
 
-impl Drop for UnlockSocketGuard {
+impl Drop for AdminSocketGuard {
     fn drop(&mut self) {
         let metadata = match fs::symlink_metadata(&self.0) {
             Ok(metadata) => metadata,
@@ -340,7 +316,7 @@ impl Drop for UnlockSocketGuard {
                 tracing::warn!(
                     socket = %self.0.display(),
                     error = %error,
-                    "failed to stat unlock socket during shutdown"
+                    "failed to stat admin socket during shutdown"
                 );
                 return;
             }
@@ -348,7 +324,7 @@ impl Drop for UnlockSocketGuard {
         if !metadata.file_type().is_socket() {
             tracing::warn!(
                 socket = %self.0.display(),
-                "refusing to remove unlock path because it is no longer a Unix socket"
+                "refusing to remove admin path because it is no longer a Unix socket"
             );
             return;
         }
@@ -356,7 +332,7 @@ impl Drop for UnlockSocketGuard {
             tracing::warn!(
                 socket = %self.0.display(),
                 error = %error,
-                "failed to remove unlock socket during shutdown"
+                "failed to remove admin socket during shutdown"
             );
         }
     }
@@ -400,4 +376,33 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn short_options_parse_like_long_options() {
+        let cli = Cli::try_parse_from([
+            "microtun-firmware-signer",
+            "-c",
+            "/tmp/config.toml",
+            "unlock",
+            "-k",
+            "test-key",
+            "-s",
+            "/tmp/unlock.sock",
+        ])
+        .expect("short CLI options should parse");
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/config.toml"));
+        match cli.command {
+            Some(Commands::Unlock(args)) => {
+                assert_eq!(args.key, "test-key");
+                assert_eq!(args.socket, Some(PathBuf::from("/tmp/unlock.sock")));
+            }
+            None => panic!("expected unlock subcommand"),
+        }
+    }
 }

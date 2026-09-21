@@ -18,7 +18,7 @@ use crate::{
     auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError},
     authorization::Authorizer,
     config::{KeyState, PolicyAction, valid_key_id},
-    key::{KeyMaterial, KeyRing, UnlockError, UnlockOutcome},
+    key::{KeyRing, UnlockError, UnlockOutcome},
 };
 use zeroize::Zeroizing;
 
@@ -63,13 +63,8 @@ struct AuditRecord {
     jti: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct HealthResponse {
-    status: &'static str,
-}
-
-pub async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+pub async fn health() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,18 +76,8 @@ pub struct GithubOAuthCallbackQuery {
 
 #[derive(Serialize)]
 struct OAuthSessionResponse {
-    token_type: &'static str,
     access_token: String,
     expires_in: u64,
-    identity: OAuthIdentityResponse,
-}
-
-#[derive(Serialize)]
-struct OAuthIdentityResponse {
-    id: String,
-    kind: &'static str,
-    github_user_id: String,
-    github_login: String,
 }
 
 /// Redirect a human user to GitHub to authorize this signer OAuth application.
@@ -137,15 +122,8 @@ pub async fn github_oauth_callback(
         .map_err(|error| oauth_flow_error(error, &request_id))?;
 
     let mut response = Json(OAuthSessionResponse {
-        token_type: "Bearer",
         access_token: grant.access_token,
         expires_in: grant.expires_in,
-        identity: OAuthIdentityResponse {
-            id: grant.identity_id,
-            kind: "github-account",
-            github_user_id: grant.user_id,
-            github_login: grant.login,
-        },
     })
     .into_response();
     response
@@ -157,86 +135,37 @@ pub async fn github_oauth_callback(
     Ok(response)
 }
 
-#[derive(Serialize)]
-pub struct KeyResponse {
-    id: String,
-    state: &'static str,
-    lock_state: &'static str,
-    public_key_pem: Option<String>,
-}
-
-pub async fn get_key(
+pub async fn get_public_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let request_id = Ulid::new().to_string();
-
     let key = if valid_key_id(&key_id) {
         state.keys.get(&key_id)
     } else {
         None
-    };
-    let Some(key) = key else {
-        let error = ApiError::new(
+    }
+    .ok_or_else(|| {
+        ApiError::new(
             StatusCode::NOT_FOUND,
             "unknown-key",
             "Unknown signing key",
             "The requested immutable signing key identifier does not exist.",
             &request_id,
-        );
-        audit_best_effort(
-            &state,
-            audit_record(
-                &request_id,
-                "get-key",
-                false,
-                error.title,
-                None,
-                AuditDetails {
-                    key_id: Some(&key_id),
-                    ..AuditDetails::default()
-                },
-            ),
         )
-        .await;
-        return Err(error);
-    };
+    })?;
 
-    let response = key_response(key);
-    audit_best_effort(
-        &state,
-        audit_record(
+    let pem = key.public_key_pem().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::LOCKED,
+            "key-locked",
+            "Signing key is locked",
+            "The public key becomes available after the signing key is unlocked.",
             &request_id,
-            "get-key",
-            true,
-            "ok",
-            None,
-            AuditDetails {
-                key_id: Some(key.id()),
-                ..AuditDetails::default()
-            },
-        ),
-    )
-    .await;
+        )
+    })?;
 
-    let mut response = Json(response).into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, "no-store".parse().expect("valid header"));
-    Ok(response)
-}
-
-fn key_response(key: &KeyMaterial) -> KeyResponse {
-    KeyResponse {
-        id: key.id().to_owned(),
-        state: key.state().as_str(),
-        lock_state: if key.is_unlocked() {
-            "unlocked"
-        } else {
-            "locked"
-        },
-        public_key_pem: key.public_key_pem(),
-    }
+    Ok(([(CONTENT_TYPE, "application/x-pem-file")], pem).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,19 +174,12 @@ struct UnlockRequest {
     passphrase: String,
 }
 
-#[derive(Serialize)]
-pub struct UnlockResponse {
-    request_id: String,
-    already_unlocked: bool,
-    key: KeyResponse,
-}
-
 pub async fn unlock_key(
     State(state): State<UnlockState>,
     Path(key_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let request_id = Ulid::new().to_string();
 
     if !is_json_content_type(&headers) {
@@ -373,19 +295,7 @@ pub async fn unlock_key(
         "firmware signer unlock audit event"
     );
 
-    let mut response = Json(UnlockResponse {
-        request_id,
-        already_unlocked: outcome == UnlockOutcome::AlreadyUnlocked,
-        key: key_response(key),
-    })
-    .into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, "no-store".parse().expect("valid header"));
-    response
-        .headers_mut()
-        .insert(PRAGMA, "no-cache".parse().expect("valid header"));
-    Ok(response)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,14 +306,7 @@ struct SigningRequest {
 
 #[derive(Serialize)]
 pub struct SignatureResponse {
-    request_id: String,
-    key: SignatureResponseKey,
     signature: String,
-}
-
-#[derive(Serialize)]
-struct SignatureResponseKey {
-    id: String,
 }
 
 pub async fn create_signature(
@@ -434,7 +337,7 @@ pub async fn create_signature(
                     request_id: attempt_request_id.clone(),
                     operation: "sign".into(),
                     success: false,
-                    reason: api_error.title.to_owned(),
+                    reason: api_error.slug.to_owned(),
                     ..AuditRecord::default()
                 },
             )
@@ -459,7 +362,7 @@ pub async fn create_signature(
                     &attempt_request_id,
                     "sign",
                     false,
-                    error.title,
+                    error.slug,
                     Some(&principal),
                     AuditDetails {
                         key_id: Some(&key_id),
@@ -482,7 +385,7 @@ pub async fn create_signature(
                     &attempt_request_id,
                     "sign",
                     false,
-                    error.title,
+                    error.slug,
                     Some(&principal),
                     AuditDetails {
                         key_id: Some(&key_id),
@@ -527,8 +430,6 @@ pub async fn create_signature(
     .await;
 
     Ok(Json(SignatureResponse {
-        request_id: attempt_request_id,
-        key: SignatureResponseKey { id: key_id },
         signature: BASE64.encode(signature),
     }))
 }
@@ -810,12 +711,8 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
 }
 
 #[derive(Debug, Serialize)]
-struct ProblemBody {
-    #[serde(rename = "type")]
-    problem_type: String,
-    title: String,
-    status: u16,
-    detail: String,
+struct ErrorBody {
+    error: &'static str,
     request_id: String,
 }
 
@@ -823,8 +720,6 @@ struct ProblemBody {
 pub struct ApiError {
     status: StatusCode,
     slug: &'static str,
-    pub title: &'static str,
-    detail: &'static str,
     request_id: String,
     authenticate: bool,
 }
@@ -833,15 +728,13 @@ impl ApiError {
     fn new(
         status: StatusCode,
         slug: &'static str,
-        title: &'static str,
-        detail: &'static str,
+        _title: &'static str,
+        _detail: &'static str,
         request_id: &str,
     ) -> Self {
         Self {
             status,
             slug,
-            title,
-            detail,
             request_id: request_id.to_owned(),
             authenticate: false,
         }
@@ -875,20 +768,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = ProblemBody {
-            problem_type: format!("urn:microtun:firmware-signing:{}", self.slug),
-            title: self.title.to_owned(),
-            status: self.status.as_u16(),
-            detail: self.detail.to_owned(),
+        let body = ErrorBody {
+            error: self.slug,
             request_id: self.request_id,
         };
         let mut response = (self.status, Json(body)).into_response();
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            "application/problem+json"
-                .parse()
-                .expect("valid content type"),
-        );
         if self.authenticate {
             response.headers_mut().insert(
                 WWW_AUTHENTICATE,

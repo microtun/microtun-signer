@@ -12,7 +12,7 @@ The signer keeps key custody separate from CI: callers authenticate with GitHub,
 - `[[Policy]]` entries bind named identities to allowed actions and key IDs.
 - GitHub Actions signing is restricted to authenticated release-tag refs. Repository, commit, ref, workflow, event, run ID, and run attempt come directly from the verified OIDC token; clients do not echo that provenance in the request body.
 - Human OAuth sessions are trusted signers. Signing requests contain no caller-supplied release or GitHub provenance metadata.
-- The TCP listener is intended for loopback/private networking. Terminate TLS at a trusted reverse proxy or load balancer. Never expose or proxy the unlock socket.
+- The TCP listener is intended for loopback/private networking. Terminate TLS at a trusted reverse proxy or load balancer. Never expose or proxy the admin socket.
 
 ## Build and run
 
@@ -39,27 +39,42 @@ Active keys must be unlocked after every service start:
 ```bash
 ./target/release/microtun-firmware-signer --config ./config.toml \
   unlock --key microtun-firmware-prod
+
+# Equivalent short options:
+./target/release/microtun-firmware-signer -c ./config.toml \
+  unlock -k microtun-firmware-prod
 ```
+
+CLI short options are `-c` for `--config`, `-k` for `--key`, and `-s` for `--socket`.
 
 On Debian/systemd deployments, use the packaged systemd credential for the GitHub OAuth client secret; the example unit and `debian/README.Debian` document the expected layout.
 
 ## HTTP API
 
-The service is intended to run on its own domain and serves the public API directly from the domain root:
+The public API has five endpoints:
 
 ```text
 GET  /healthz
-GET  /v1/auth/github/login
+GET  /v1/auth/github
 GET  /v1/auth/github/callback
-GET  /v1/keys/{key_id}
-POST /v1/keys/{key_id}/signatures
+GET  /v1/public-key/{key_id}
+POST /v1/sign/{key_id}
 ```
 
-`POST /v1/keys/{key_id}/signatures` requires `Authorization: Bearer <token>` and `Content-Type: application/json`. `digest` is exactly one 32-byte MCUboot SHA-256 digest encoded as base64. The returned `signature` is a base64 Ed25519 signature.
+`GET /healthz` returns `204 No Content` when the process is serving requests.
 
-### GitHub Actions
+Human users start authentication at `GET /v1/auth/github`. The callback returns only the signer-local bearer credential and its lifetime:
 
-Actions callers send only the digest:
+```json
+{
+  "access_token": "<signer-local-token>",
+  "expires_in": 28800
+}
+```
+
+`GET /v1/public-key/{key_id}` returns only the Ed25519 public key as an SPKI PEM (`application/x-pem-file`). The key must have been unlocked since service startup; no key metadata is exposed.
+
+`POST /v1/sign/{key_id}` requires `Authorization: Bearer <token>` and `Content-Type: application/json`. The body contains exactly one 32-byte MCUboot SHA-256 digest encoded as base64:
 
 ```json
 {
@@ -67,35 +82,26 @@ Actions callers send only the digest:
 }
 ```
 
-The signer still requires an authenticated GitHub tag ref for Actions callers. Tag names are treated as opaque provenance; no release metadata is derived from them or accepted in the request body.
-
-Repository, repository ID, commit SHA, ref, actor, workflow, event, run ID, and run attempt are taken directly from the verified OIDC claims and recorded in the audit log.
-
-### Human OAuth session
-
-Human callers use the same minimal request body:
+A successful response contains only the Ed25519 signature:
 
 ```json
 {
-  "digest": "<32-byte-digest-as-base64>"
-}
-```
-
-The signing body accepts no additional metadata: repository, ref, commit, workflow, algorithm, message type, encoding, and key ID are all server-side or fixed by the endpoint contract.
-
-A successful signing response is intentionally small:
-
-```json
-{
-  "request_id": "01...",
-  "key": {
-    "id": "microtun-firmware-prod"
-  },
   "signature": "<base64-ed25519-signature>"
 }
 ```
 
-`GET /v1/keys/{key_id}` returns the key ID, lifecycle state, lock state, and the public key PEM when the key is unlocked.
+Errors use the HTTP status plus a compact body for programmatic handling and audit correlation:
+
+```json
+{
+  "error": "<stable-error-code>",
+  "request_id": "01..."
+}
+```
+
+For GitHub Actions callers, repository, commit, ref, actor, workflow, event, run ID, and run attempt come directly from the verified OIDC token and are recorded in the audit log. Actions signing still requires an authenticated tag ref. Human OAuth sessions use the same signing request body and do not supply release provenance.
+
+Key unlock is a local management operation only, available over the Unix-domain socket configured by `Server.AdminSocketPath`/`Server.AdminSocketMode` at `POST /v1/unlock/{key_id}`; successful unlocks return `204 No Content`.
 
 ## Development
 

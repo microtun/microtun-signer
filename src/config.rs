@@ -24,8 +24,6 @@ pub struct Config {
     pub microtun: MicrotunConfig,
     #[serde(rename = "Server")]
     pub server: ServerConfig,
-    #[serde(rename = "Unlock", default)]
-    pub unlock: UnlockConfig,
     #[serde(rename = "Key")]
     pub keys: Vec<KeyConfig>,
     #[serde(rename = "GitHub")]
@@ -52,24 +50,10 @@ pub struct MicrotunConfig {
 pub struct ServerConfig {
     #[serde(rename = "Listen")]
     pub listen: SocketAddr,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnlockConfig {
-    #[serde(rename = "SocketPath", default = "default_unlock_socket_path")]
-    pub socket_path: PathBuf,
-    #[serde(rename = "SocketMode", default = "default_unlock_socket_mode")]
-    pub socket_mode: u32,
-}
-
-impl Default for UnlockConfig {
-    fn default() -> Self {
-        Self {
-            socket_path: default_unlock_socket_path(),
-            socket_mode: default_unlock_socket_mode(),
-        }
-    }
+    #[serde(rename = "AdminSocketPath", default = "default_admin_socket_path")]
+    pub admin_socket_path: PathBuf,
+    #[serde(rename = "AdminSocketMode", default = "default_admin_socket_mode")]
+    pub admin_socket_mode: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -257,15 +241,15 @@ impl Config {
             );
         }
 
-        if !self.unlock.socket_path.is_absolute() {
-            bail!("Unlock.SocketPath must be an absolute path");
+        if !self.server.admin_socket_path.is_absolute() {
+            bail!("Server.AdminSocketPath must be an absolute path");
         }
-        if self.unlock.socket_mode > 0o777
-            || self.unlock.socket_mode & 0o600 != 0o600
-            || self.unlock.socket_mode & 0o007 != 0
+        if self.server.admin_socket_mode > 0o777
+            || self.server.admin_socket_mode & 0o600 != 0o600
+            || self.server.admin_socket_mode & 0o007 != 0
         {
             bail!(
-                "Unlock.SocketMode must grant owner read/write, must not grant access to other users, and must fit within 0777"
+                "Server.AdminSocketMode must grant owner read/write, must not grant access to other users, and must fit within 0777"
             );
         }
 
@@ -282,7 +266,7 @@ impl Config {
             }
             if key.passphrase_credential.is_some() {
                 bail!(
-                    "Key.PassphraseCredential is no longer supported; signing keys start locked and must be unlocked through the local unlock API"
+                    "Key.PassphraseCredential is no longer supported; signing keys start locked and must be unlocked through the local admin API"
                 );
             }
         }
@@ -560,11 +544,11 @@ fn valid_credential_name(value: &str) -> bool {
     valid_key_id(value)
 }
 
-fn default_unlock_socket_path() -> PathBuf {
-    PathBuf::from("/run/microtun-firmware-signer/unlock.sock")
+fn default_admin_socket_path() -> PathBuf {
+    PathBuf::from("/run/microtun-firmware-signer/admin.sock")
 }
 
-const fn default_unlock_socket_mode() -> u32 {
+const fn default_admin_socket_mode() -> u32 {
     0o660
 }
 
@@ -668,7 +652,7 @@ Keys = ["test-key"]
     }
 
     #[test]
-    fn unlock_socket_defaults_to_local_runtime_path() {
+    fn server_admin_socket_defaults_to_local_runtime_path() {
         let text = base_config(
             r#"[[Identity]]
 ID = "maintainer"
@@ -684,10 +668,53 @@ Keys = ["test-key"]
         let mut config: Config = toml::from_str(&text).unwrap();
         config.normalize_and_validate().unwrap();
         assert_eq!(
-            config.unlock.socket_path,
-            PathBuf::from("/run/microtun-firmware-signer/unlock.sock")
+            config.server.admin_socket_path,
+            PathBuf::from("/run/microtun-firmware-signer/admin.sock")
         );
-        assert_eq!(config.unlock.socket_mode, 0o660);
+        assert_eq!(config.server.admin_socket_mode, 0o660);
+    }
+
+    #[test]
+    fn legacy_server_socket_fields_are_rejected() {
+        let text = base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#,
+        )
+        .replace(
+            "Listen = \"127.0.0.1:8080\"",
+            "Listen = \"127.0.0.1:8080\"\nSocketPath = \"/run/microtun-firmware-signer/unlock.sock\"\nSocketMode = 0o660",
+        );
+        let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+        assert!(error.contains("SocketPath") || error.contains("SocketMode"));
+    }
+
+    #[test]
+    fn legacy_unlock_block_is_rejected() {
+        let text = base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+
+[Unlock]
+SocketPath = "/run/microtun-firmware-signer/unlock.sock"
+"#,
+        );
+        let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+        assert!(error.contains("Unlock"));
     }
 
     #[test]

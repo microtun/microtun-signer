@@ -52,7 +52,6 @@ pub struct KeyMaterial {
 
 struct UnlockedKeyMaterial {
     signing_key: SigningKey,
-    public_key_pem: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,21 +93,6 @@ impl KeyMaterial {
         })
     }
 
-    fn unlocked_from_signing_key(signing_key: SigningKey) -> Result<UnlockedKeyMaterial> {
-        let verifying_key = signing_key.verifying_key();
-        let mut public_key_pem = verifying_key
-            .to_public_key_pem(LineEnding::LF)
-            .context("failed to encode Ed25519 public key as SPKI PEM")?;
-        if !public_key_pem.ends_with('\n') {
-            public_key_pem.push('\n');
-        }
-
-        Ok(UnlockedKeyMaterial {
-            signing_key,
-            public_key_pem,
-        })
-    }
-
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -125,10 +109,17 @@ impl KeyMaterial {
     }
 
     pub fn public_key_pem(&self) -> Option<String> {
-        self.unlocked
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|key| key.public_key_pem.clone()))
+        let guard = self.unlocked.read().ok()?;
+        let key = guard.as_ref()?;
+        let mut pem = key
+            .signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .ok()?;
+        if !pem.ends_with('\n') {
+            pem.push('\n');
+        }
+        Some(pem)
     }
 
     pub fn unlock(&self, passphrase: &str) -> Result<UnlockOutcome, UnlockError> {
@@ -151,8 +142,7 @@ impl KeyMaterial {
             passphrase.as_bytes(),
         )
         .map_err(|_| UnlockError::InvalidPassphrase)?;
-        let unlocked = Self::unlocked_from_signing_key(signing_key)
-            .map_err(|_| UnlockError::InvalidPassphrase)?;
+        let unlocked = UnlockedKeyMaterial { signing_key };
 
         let mut guard = self
             .unlocked
