@@ -953,27 +953,27 @@ fn matches_github_actions_identity(
         return false;
     }
 
-    if let Some(expected) = &identity.required_environment {
-        if claims.environment.as_deref() != Some(expected.as_str()) {
-            return false;
-        }
+    if let Some(expected) = &identity.required_environment
+        && claims.environment.as_deref() != Some(expected.as_str())
+    {
+        return false;
     }
-    if let Some(expected) = &identity.required_runner_environment {
-        if claims.runner_environment.as_deref() != Some(expected.as_str()) {
-            return false;
-        }
+    if let Some(expected) = &identity.required_runner_environment
+        && claims.runner_environment.as_deref() != Some(expected.as_str())
+    {
+        return false;
     }
-    if let Some(allowed_workflow_shas) = &identity.allowed_workflow_shas {
-        if !allowed_workflow_shas.is_empty() {
-            let Some(workflow_sha) = claims.workflow_sha.as_ref() else {
-                return false;
-            };
-            if !allowed_workflow_shas
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(workflow_sha))
-            {
-                return false;
-            }
+    if let Some(allowed_workflow_shas) = &identity.allowed_workflow_shas
+        && !allowed_workflow_shas.is_empty()
+    {
+        let Some(workflow_sha) = claims.workflow_sha.as_ref() else {
+            return false;
+        };
+        if !allowed_workflow_shas
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(workflow_sha))
+        {
+            return false;
         }
     }
 

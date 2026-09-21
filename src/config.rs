@@ -512,10 +512,10 @@ fn validate_actions_identity(identity: &IdentityConfig) -> Result<()> {
         bail!("Identity.AllowedEventNames must not be empty or contain empty values");
     }
 
-    if let Some(ref_types) = &identity.allowed_ref_types {
-        if ref_types.is_empty() || ref_types.iter().any(|value| value.trim().is_empty()) {
-            bail!("Identity.AllowedRefTypes must not be empty or contain empty values");
-        }
+    if let Some(ref_types) = &identity.allowed_ref_types
+        && (ref_types.is_empty() || ref_types.iter().any(|value| value.trim().is_empty()))
+    {
+        bail!("Identity.AllowedRefTypes must not be empty or contain empty values");
     }
     if identity
         .required_environment
