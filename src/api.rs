@@ -5,17 +5,18 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{
-        HeaderMap, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA, WWW_AUTHENTICATE},
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA, SET_COOKIE, WWW_AUTHENTICATE},
     },
     response::{IntoResponse, Redirect, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use ulid::Ulid;
 
 use crate::{
-    auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError},
+    auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError, cookie_header},
     authorization::Authorizer,
     config::{KeyState, PolicyAction, valid_key_id},
     key::{KeyRing, UnlockError, UnlockOutcome},
@@ -29,9 +30,23 @@ pub struct AppState {
     pub authz: Authorizer,
 }
 
+/// State for the local-only admin API served on the Unix-domain socket.
 #[derive(Clone)]
-pub struct UnlockState {
+pub struct AdminState {
     pub keys: Arc<KeyRing>,
+    /// Allows one key decryption at a time. Each attempt runs a deliberately
+    /// expensive KDF (scrypt may use up to 1 GiB), so concurrent attempts are
+    /// queued rather than multiplied.
+    pub unlock_permits: Arc<Semaphore>,
+}
+
+impl AdminState {
+    pub fn new(keys: Arc<KeyRing>) -> Self {
+        Self {
+            keys,
+            unlock_permits: Arc::new(Semaphore::new(1)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +70,8 @@ struct AuditRecord {
     repository: Option<String>,
     repository_id: Option<String>,
     git_ref: Option<String>,
+    ref_protected: Option<bool>,
+    environment: Option<String>,
     commit_sha: Option<String>,
     event_name: Option<String>,
     workflow_ref: Option<String>,
@@ -81,58 +98,81 @@ struct OAuthSessionResponse {
 }
 
 /// Redirect a human user to GitHub to authorize this signer OAuth application.
-pub async fn github_oauth_login(State(state): State<AppState>) -> Result<Redirect, ApiError> {
+/// The flow is bound to this browser with an authenticated `__Host-` cookie
+/// and to this signer with PKCE; no server-side state is created.
+pub async fn github_oauth_login(State(state): State<AppState>) -> Result<Response, ApiError> {
     let request_id = Ulid::new().to_string();
-    let url = state
+    let start = state
         .auth
-        .github_oauth_authorize_url()
-        .await
+        .github_oauth_start()
         .map_err(|error| oauth_flow_error(error, &request_id))?;
-    Ok(Redirect::temporary(&url))
+    let mut response = Redirect::temporary(&start.authorize_url).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&start.set_cookie).expect("cookie is ASCII"),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
-/// GitHub OAuth callback. The signer exchanges the one-time GitHub code using
-/// its own client secret, maps the account to a configured identity, and mints
-/// a short-lived signer-local bearer credential. The GitHub token is not
-/// returned to the caller.
+/// GitHub OAuth callback. The signer verifies the browser-bound state,
+/// exchanges the one-time GitHub code with its client secret and PKCE
+/// verifier, requires the account to have 2FA enabled, revokes the GitHub
+/// token, and mints a short-lived signer-local bearer credential.
 pub async fn github_oauth_callback(
     State(state): State<AppState>,
     Query(query): Query<GithubOAuthCallbackQuery>,
-) -> Result<Response, ApiError> {
+    headers: HeaderMap,
+) -> Response {
     let request_id = Ulid::new().to_string();
+    let result = complete_oauth_callback(&state, &query, &headers).await;
+    let mut response = match result {
+        Ok(grant) => Json(OAuthSessionResponse {
+            access_token: grant.access_token,
+            expires_in: grant.expires_in,
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(
+                target: "microtun_firmware_signer::audit",
+                request_id = %request_id,
+                operation = "oauth-login",
+                success = false,
+                reason = %error,
+                "firmware signer login audit event"
+            );
+            oauth_flow_error(error, &request_id).into_response()
+        }
+    };
+    let headers = response.headers_mut();
+    // The flow cookie is single-purpose; drop it whatever the outcome.
+    headers.insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&Authenticator::oauth_clear_cookie()).expect("cookie is ASCII"),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+async fn complete_oauth_callback(
+    state: &AppState,
+    query: &GithubOAuthCallbackQuery,
+    headers: &HeaderMap,
+) -> Result<crate::auth::OAuthSessionGrant, OAuthFlowError> {
     if query.error.is_some() {
-        return Err(oauth_flow_error(
-            OAuthFlowError::AuthorizationDenied,
-            &request_id,
-        ));
+        return Err(OAuthFlowError::AuthorizationDenied);
     }
     let code = query
         .code
         .as_deref()
-        .ok_or_else(|| oauth_flow_error(OAuthFlowError::AuthorizationDenied, &request_id))?;
-    let oauth_state = query
-        .state
-        .as_deref()
-        .ok_or_else(|| oauth_flow_error(OAuthFlowError::InvalidState, &request_id))?;
-
-    let grant = state
+        .ok_or(OAuthFlowError::AuthorizationDenied)?;
+    let oauth_state = query.state.as_deref().ok_or(OAuthFlowError::InvalidState)?;
+    state
         .auth
-        .complete_github_oauth(code, oauth_state)
+        .complete_github_oauth(code, oauth_state, cookie_header(headers))
         .await
-        .map_err(|error| oauth_flow_error(error, &request_id))?;
-
-    let mut response = Json(OAuthSessionResponse {
-        access_token: grant.access_token,
-        expires_in: grant.expires_in,
-    })
-    .into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, "no-store".parse().expect("valid header"));
-    response
-        .headers_mut()
-        .insert(PRAGMA, "no-cache".parse().expect("valid header"));
-    Ok(response)
 }
 
 pub async fn get_public_key(
@@ -175,7 +215,7 @@ struct UnlockRequest {
 }
 
 pub async fn unlock_key(
-    State(state): State<UnlockState>,
+    State(state): State<AdminState>,
     Path(key_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -236,7 +276,28 @@ pub async fn unlock_key(
     }
     let passphrase = Zeroizing::new(request.passphrase);
 
-    let outcome = match key.unlock(passphrase.as_str()) {
+    // The KDF takes hundreds of milliseconds to seconds of CPU, so it runs on
+    // the blocking pool instead of stalling a runtime worker. The permit is
+    // moved into the blocking task: if the client disconnects, the permit is
+    // still held until the decryption actually finishes.
+    let permit = state
+        .unlock_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| unlock_task_failed(&request_id, key.id()))?;
+    let keys = state.keys.clone();
+    let blocking_key_id = key.id().to_owned();
+    let unlock_result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        keys.get(&blocking_key_id)
+            .expect("key existence was checked before spawning")
+            .unlock(passphrase.as_str())
+    })
+    .await
+    .map_err(|_| unlock_task_failed(&request_id, key.id()))?;
+
+    let outcome = match unlock_result {
         Ok(outcome) => outcome,
         Err(UnlockError::Inactive) => {
             tracing::warn!(
@@ -296,6 +357,25 @@ pub async fn unlock_key(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn unlock_task_failed(request_id: &str, key_id: &str) -> ApiError {
+    tracing::error!(
+        target: "microtun_firmware_signer::audit",
+        request_id = %request_id,
+        operation = "unlock-key",
+        success = false,
+        reason = "unlock-task-failed",
+        key_id = key_id,
+        "firmware signer unlock audit event"
+    );
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "key-unlock-failure",
+        "Signing key unlock failed",
+        "The signing key could not be unlocked due to an internal error.",
+        request_id,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,6 +594,18 @@ fn validate_signing_context(principal: &AuthPrincipal) -> Result<(), ApiError> {
         ));
     }
 
+    // Anyone who can push a tag controls the workflow file at that tag. Only
+    // accept tags that GitHub reports as protected by a ruleset, so that
+    // creating a release tag is itself a privileged operation.
+    if !actions.ref_protected {
+        return Err(ApiError::without_request_id(
+            StatusCode::FORBIDDEN,
+            "protected-ref-required",
+            "A protected release tag is required",
+            "Firmware signing from GitHub Actions requires a tag protected by a GitHub ruleset.",
+        ));
+    }
+
     let Some(tag) = actions.git_ref.strip_prefix("refs/tags/") else {
         return Err(ApiError::without_request_id(
             StatusCode::FORBIDDEN,
@@ -548,7 +640,7 @@ fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
             StatusCode::BAD_REQUEST,
             "oauth-state-invalid",
             "GitHub OAuth state is invalid or expired",
-            "Restart the GitHub login flow and try again.",
+            "Restart the GitHub login flow in the same browser and try again.",
             request_id,
         ),
         OAuthFlowError::AuthorizationDenied => ApiError::new(
@@ -565,6 +657,13 @@ fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
             "The signer could not exchange the GitHub authorization code.",
             request_id,
         ),
+        OAuthFlowError::ScopeNotGranted => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "oauth-scope-not-granted",
+            "GitHub did not grant the read:user scope",
+            "The read:user scope is required to verify two-factor authentication.",
+            request_id,
+        ),
         OAuthFlowError::IdentityProviderUnavailable => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "identity-provider-unavailable",
@@ -579,7 +678,14 @@ fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
             "The authenticated GitHub account is not configured as a signer identity.",
             request_id,
         ),
-        OAuthFlowError::SessionCapacity | OAuthFlowError::StateCapacity => ApiError::new(
+        OAuthFlowError::TwoFactorRequired => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "github-2fa-required",
+            "GitHub two-factor authentication is required",
+            "Enable two-factor authentication on the GitHub account and log in again.",
+            request_id,
+        ),
+        OAuthFlowError::SessionCapacity => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "oauth-capacity-exhausted",
             "GitHub OAuth login is temporarily unavailable",
@@ -612,6 +718,18 @@ fn auth_error(error: AuthError, request_id: &str) -> ApiError {
             "The signer could not verify the GitHub account credential.",
             request_id,
         ),
+        AuthError::ReplayCacheUnavailable => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc-replay-cache-unavailable",
+            "OIDC replay protection is temporarily unavailable",
+            "The signer could not record the GitHub Actions token as used.",
+            request_id,
+        ),
+        AuthError::TokenReplayed => {
+            let mut error = ApiError::unauthorized(request_id);
+            error.slug = "token-replayed";
+            error
+        }
         AuthError::MissingBearer | AuthError::TokenTooLarge | AuthError::InvalidToken => {
             ApiError::unauthorized(request_id)
         }
@@ -669,6 +787,8 @@ fn audit_record(
         repository: actions.map(|identity| identity.repository.clone()),
         repository_id: actions.map(|identity| identity.repository_id.clone()),
         git_ref: actions.map(|identity| identity.git_ref.clone()),
+        ref_protected: actions.map(|identity| identity.ref_protected),
+        environment: actions.and_then(|identity| identity.environment.clone()),
         commit_sha: actions.map(|identity| identity.sha.clone()),
         event_name: actions.map(|identity| identity.event_name.clone()),
         workflow_ref: actions.map(|identity| identity.workflow_ref.clone()),
@@ -700,6 +820,8 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
         repository = record.repository.as_deref().unwrap_or(""),
         repository_id = record.repository_id.as_deref().unwrap_or(""),
         git_ref = record.git_ref.as_deref().unwrap_or(""),
+        ref_protected = record.ref_protected.unwrap_or(false),
+        environment = record.environment.as_deref().unwrap_or(""),
         commit_sha = record.commit_sha.as_deref().unwrap_or(""),
         event_name = record.event_name.as_deref().unwrap_or(""),
         workflow_ref = record.workflow_ref.as_deref().unwrap_or(""),
@@ -814,9 +936,11 @@ mod tests {
                 actor_id: Some("456".into()),
                 git_ref: git_ref.into(),
                 ref_type: ref_type.into(),
+                ref_protected: true,
                 sha: "abcdef".into(),
                 workflow_ref: "owner/repo/.github/workflows/release.yml@refs/tags/v1.2.3".into(),
                 event_name: "push".into(),
+                environment: Some("firmware-signing".into()),
                 run_id: "42".into(),
                 run_attempt: "1".into(),
             })),
@@ -827,6 +951,17 @@ mod tests {
     fn actions_signing_accepts_an_authenticated_tag_without_parsing_it_as_a_version() {
         let principal = actions_principal("refs/tags/release-candidate", "tag");
         assert!(validate_signing_context(&principal).is_ok());
+    }
+
+    #[test]
+    fn actions_signing_requires_a_protected_tag() {
+        let mut principal = actions_principal("refs/tags/v1.2.3", "tag");
+        let AuthSource::GithubActions(actions) = &mut principal.source else {
+            unreachable!()
+        };
+        actions.ref_protected = false;
+        let error = validate_signing_context(&principal).unwrap_err();
+        assert_eq!(error.slug, "protected-ref-required");
     }
 
     #[test]
@@ -852,5 +987,68 @@ mod tests {
         };
 
         assert!(validate_signing_context(&principal).is_ok());
+    }
+
+    fn admin_state() -> AdminState {
+        let keys = KeyRing::from_keys_for_tests(vec![crate::key::KeyMaterial::from_pem_for_tests(
+            "prod",
+            include_str!("../tests/fixtures/test-ed25519-scrypt.pem"),
+        )]);
+        AdminState::new(Arc::new(keys))
+    }
+
+    fn unlock_request(passphrase: &str) -> (HeaderMap, Bytes) {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let body = serde_json::to_vec(&serde_json::json!({ "passphrase": passphrase })).unwrap();
+        (headers, Bytes::from(body))
+    }
+
+    /// On a single-threaded runtime, a KDF running inline would starve every
+    /// other task until it finished. Here a ticker keeps running throughout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unlock_kdf_does_not_block_the_async_runtime() {
+        let state = admin_state();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let (headers, body) = unlock_request("test-passphrase");
+        let status = unlock_key(State(state.clone()), Path("prod".into()), headers, body)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.keys.get("prod").unwrap().is_unlocked());
+        let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        // Expect roughly one tick per 5 ms of KDF time; demand at least a third.
+        let expected = elapsed.as_millis() as usize / 15;
+        assert!(
+            ticks >= expected.max(1),
+            "runtime starved: {ticks} ticks during {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_passphrase_is_rejected_through_the_blocking_path() {
+        let state = admin_state();
+        let (headers, body) = unlock_request("wrong");
+        let error = unlock_key(State(state.clone()), Path("prod".into()), headers, body)
+            .await
+            .unwrap_err();
+        assert_eq!(error.slug, "invalid-key-passphrase");
+        assert!(!state.keys.get("prod").unwrap().is_unlocked());
+        // The permit was released, so a later attempt can proceed.
+        assert_eq!(state.unlock_permits.available_permits(), 1);
     }
 }

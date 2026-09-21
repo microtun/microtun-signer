@@ -7,9 +7,13 @@ Wants=network-online.target
 Type=simple
 User=microtun-firmware-signer
 Group=microtun-firmware-signer
+# Needed to hand the admin socket to the operators group (AdminSocketGroup).
+SupplementaryGroups=microtun-signer-operators
 LoadCredentialEncrypted=github-oauth-client-secret:/etc/credstore.encrypted/microtun-github-oauth-client-secret
 RuntimeDirectory=microtun-firmware-signer
-RuntimeDirectoryMode=0750
+# Operators are not in the service group, so they need search (x) permission
+# to reach the socket. The socket itself is 0660 service-user:operators.
+RuntimeDirectoryMode=0751
 ExecStart=/usr/bin/microtun-firmware-signer
 Restart=on-failure
 RestartSec=2s

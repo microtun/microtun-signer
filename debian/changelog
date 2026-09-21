@@ -1,5 +1,6 @@
 microtun-firmware-signer (0.4.0) UNRELEASED; urgency=medium
 
+  * Harden security and access controls
   * Reduce the HTTP API to the essential auth and signing operations
 
  -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 23:15:00 +0200

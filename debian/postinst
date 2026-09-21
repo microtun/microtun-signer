@@ -3,37 +3,58 @@ set -e
 
 SERVICE_USER="microtun-firmware-signer"
 SERVICE_GROUP="microtun-firmware-signer"
+# Operators who unlock keys join this group only. It grants access to the
+# admin socket, but not to the key file and configuration, which
+# belong to the service group.
+OPERATOR_GROUP="microtun-signer-operators"
 CONFIG_DIR="/etc/microtun-firmware-signer"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 
-# The systemd unit runs under a dedicated unprivileged account. Create it here
-# rather than relying on a pre-existing local account.
-if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
-    addgroup --system "$SERVICE_GROUP"
-fi
+case "$1" in
+    configure)
+        # The systemd unit runs under a dedicated unprivileged account. Create
+        # it here rather than relying on a pre-existing local account.
+        if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+            addgroup --system "$SERVICE_GROUP"
+        fi
 
-if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
-    adduser \
-        --system \
-        --ingroup "$SERVICE_GROUP" \
-        --home /nonexistent \
-        --no-create-home \
-        --disabled-login \
-        --gecos "Microtun firmware signer" \
-        "$SERVICE_USER"
-fi
+        # Must exist before the service starts: the unit names it in
+        # SupplementaryGroups= so the service can hand the socket to it.
+        if ! getent group "$OPERATOR_GROUP" >/dev/null 2>&1; then
+            addgroup --system "$OPERATOR_GROUP"
+        fi
 
-# The packaged example configuration is intentionally 0640. Make the service
-# group its group owner so the systemd service can read it after configuration.
-if [ -d "$CONFIG_DIR" ]; then
-    chown root:"$SERVICE_GROUP" "$CONFIG_DIR"
-    chmod 0750 "$CONFIG_DIR"
-fi
+        if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+            adduser \
+                --system \
+                --ingroup "$SERVICE_GROUP" \
+                --home /nonexistent \
+                --no-create-home \
+                --disabled-login \
+                --gecos "Microtun firmware signer" \
+                "$SERVICE_USER"
+        fi
 
-if [ -f "$CONFIG_FILE" ]; then
-    chown root:"$SERVICE_GROUP" "$CONFIG_FILE"
-    chmod 0640 "$CONFIG_FILE"
-fi
+        # The packaged example configuration is intentionally 0640. Make the
+        # service group its group owner so the service can read it.
+        if [ -d "$CONFIG_DIR" ]; then
+            chown root:"$SERVICE_GROUP" "$CONFIG_DIR"
+            chmod 0750 "$CONFIG_DIR"
+        fi
+        if [ -f "$CONFIG_FILE" ]; then
+            chown root:"$SERVICE_GROUP" "$CONFIG_FILE"
+            chmod 0640 "$CONFIG_FILE"
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
 
 #DEBHELPER#
 

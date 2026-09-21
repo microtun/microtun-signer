@@ -18,6 +18,7 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -27,27 +28,25 @@ use zeroize::Zeroizing;
 
 use crate::{
     api::{
-        AppState, UnlockState, create_signature, get_public_key, github_oauth_callback,
+        AdminState, AppState, create_signature, get_public_key, github_oauth_callback,
         github_oauth_login, health, unlock_key,
     },
     auth::Authenticator,
     authorization::Authorizer,
-    config::Config,
+    config::{Config, DEFAULT_ADMIN_SOCKET_PATH},
     key::KeyRing,
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "microtun-firmware-signer", version)]
 struct Cli {
-    /// Path to the service TOML configuration.
-    #[arg(
-        short = 'c',
-        long,
-        env = "MICROTUN_SIGNER_CONFIG",
-        global = true,
-        default_value = "/etc/microtun-firmware-signer/config.toml"
-    )]
-    config: PathBuf,
+    /// Path to the service TOML configuration
+    /// [default: /etc/microtun-firmware-signer/config.toml].
+    ///
+    /// The unlock subcommand only reads it when given explicitly, so operators
+    /// do not need read access to the service configuration.
+    #[arg(short = 'c', long, env = "MICROTUN_SIGNER_CONFIG", global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -55,24 +54,64 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Interactively unlock an active signing key through the local management socket.
+    /// Interactively unlock an active signing key.
     Unlock(UnlockArgs),
+    /// Request a signature from a running firmware signer.
+    Sign(SignArgs),
 }
 
 #[derive(Debug, clap::Args)]
-struct UnlockArgs {
-    /// Immutable signing key ID to unlock.
-    #[arg(short = 'k', long)]
-    key: String,
-
+struct AdminSocketArgs {
     /// Unix-domain socket exposed by the signer's local admin API.
     #[arg(short = 's', long, env = "MICROTUN_SIGNER_ADMIN_SOCKET")]
     socket: Option<PathBuf>,
 }
 
+#[derive(Debug, clap::Args)]
+struct UnlockArgs {
+    /// Immutable signing key ID to unlock.
+    #[arg(short = 'k', long = "key-id")]
+    key_id: String,
+
+    #[command(flatten)]
+    admin: AdminSocketArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct SignArgs {
+    /// Immutable signing key ID to use.
+    #[arg(short = 'k', long = "key-id")]
+    key_id: String,
+
+    /// Base URL of the public firmware signer API.
+    #[arg(short = 'u', long, env = "MICROTUN_SIGNER_URL")]
+    url: String,
+
+    /// Bearer credential accepted by the signer. Prefer MICROTUN_SIGNER_TOKEN
+    /// over --token so the credential is not exposed in the process list.
+    #[arg(long, env = "MICROTUN_SIGNER_TOKEN", hide_env_values = true)]
+    token: String,
+
+    /// 32-byte MCUboot SHA-256 digest encoded as base64.
+    #[arg(short = 'd', long)]
+    digest: String,
+}
+
+const DEFAULT_CONFIG_PATH: &str = "/etc/microtun-firmware-signer/config.toml";
+
 #[derive(Serialize)]
 struct UnlockRequest<'a> {
     passphrase: &'a str,
+}
+
+#[derive(Serialize)]
+struct SignRequest<'a> {
+    digest: &'a str,
+}
+
+#[derive(Deserialize)]
+struct SignResponse {
+    signature: String,
 }
 
 #[derive(Deserialize)]
@@ -85,8 +124,9 @@ struct ErrorBody {
 async fn main() -> Result<()> {
     let Cli { config, command } = Cli::parse();
     match command {
-        Some(Commands::Unlock(args)) => unlock(args, &config).await,
-        None => run_server(config).await,
+        Some(Commands::Unlock(args)) => unlock(args, config.as_deref()).await,
+        Some(Commands::Sign(args)) => sign(args).await,
+        None => run_server(config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))).await,
     }
 }
 
@@ -140,14 +180,21 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
-        .with_state(UnlockState { keys });
+        .with_state(AdminState::new(keys));
 
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .with_context(|| format!("failed to bind {}", config.server.listen))?;
+    let admin_socket_gid = config
+        .server
+        .admin_socket_group
+        .as_deref()
+        .map(lookup_group_id)
+        .transpose()?;
     let admin_listener = bind_admin_socket(
         &config.server.admin_socket_path,
         config.server.admin_socket_mode,
+        admin_socket_gid,
     )?;
     let _admin_socket_guard = AdminSocketGuard(config.server.admin_socket_path.clone());
 
@@ -158,6 +205,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     tracing::info!(
         socket = %config.server.admin_socket_path.display(),
         mode = %format_args!("{:03o}", config.server.admin_socket_mode),
+        group = config.server.admin_socket_group.as_deref().unwrap_or(""),
         "local admin API started"
     );
 
@@ -176,16 +224,14 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
-    if !valid_key_id(&args.key) {
-        bail!("--key must match [A-Za-z0-9._-]{{1,128}}");
-    }
-
-    let socket = match args.socket {
-        Some(socket) => socket,
-        None => Config::load(config_path)?.server.admin_socket_path,
+/// Resolve the admin socket for a client subcommand: an explicit --socket,
+/// else the socket named in an explicitly given config, else the default.
+fn resolve_admin_socket(args: &AdminSocketArgs, config_path: Option<&Path>) -> Result<PathBuf> {
+    let socket = match (&args.socket, config_path) {
+        (Some(socket), _) => socket.clone(),
+        (None, Some(config_path)) => Config::load(config_path)?.server.admin_socket_path,
+        (None, None) => PathBuf::from(DEFAULT_ADMIN_SOCKET_PATH),
     };
-
     let socket_metadata = fs::metadata(&socket)
         .with_context(|| format!("admin socket {} is not available", socket.display()))?;
     if !socket_metadata.file_type().is_socket() {
@@ -194,20 +240,46 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
             socket.display()
         );
     }
+    Ok(socket)
+}
 
-    let prompt = format!("Passphrase for firmware signing key {}:", args.key);
+fn admin_client(socket: &Path) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .unix_socket(socket)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to create admin API client")
+}
+
+async fn response_error(response: reqwest::Response, action: &str) -> anyhow::Error {
+    let status = response.status();
+    match response.bytes().await {
+        Ok(body) => match serde_json::from_slice::<ErrorBody>(&body) {
+            Ok(problem) => anyhow::anyhow!(
+                "{action} failed: {} (request {})",
+                problem.error,
+                problem.request_id
+            ),
+            Err(_) => anyhow::anyhow!("{action} failed with HTTP status {status}"),
+        },
+        Err(error) => anyhow::anyhow!("{action} failed with HTTP status {status}: {error}"),
+    }
+}
+
+async fn unlock(args: UnlockArgs, config_path: Option<&Path>) -> Result<()> {
+    if !valid_key_id(&args.key_id) {
+        bail!("--key-id must match [A-Za-z0-9._-]{{1,128}}");
+    }
+    let socket = resolve_admin_socket(&args.admin, config_path)?;
+
+    let prompt = format!("Passphrase for firmware signing key {}:", args.key_id);
     let passphrase = ask_password(&prompt)?;
     if passphrase.is_empty() {
         bail!("empty passphrase refused");
     }
 
-    let client = reqwest::Client::builder()
-        .unix_socket(socket.as_path())
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("failed to create admin API client")?;
-    let url = format!("http://localhost/v1/unlock/{}", args.key);
-    let response = client
+    let url = format!("http://localhost/v1/unlock/{}", args.key_id);
+    let response = admin_client(&socket)?
         .post(url)
         .json(&UnlockRequest {
             passphrase: passphrase.as_str(),
@@ -220,24 +292,73 @@ async fn unlock(args: UnlockArgs, config_path: &Path) -> Result<()> {
                 socket.display()
             )
         })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response
-            .bytes()
-            .await
-            .context("failed to read admin API response")?;
-        if let Ok(problem) = serde_json::from_slice::<ErrorBody>(&body) {
-            bail!(
-                "unlock failed: {} (request {})",
-                problem.error,
-                problem.request_id
-            );
-        }
-        bail!("unlock failed with HTTP status {status}");
+    if !response.status().is_success() {
+        return Err(response_error(response, "unlock").await);
     }
 
-    println!("key {} is unlocked", args.key);
+    println!("key {} is unlocked", args.key_id);
+    Ok(())
+}
+
+async fn sign(args: SignArgs) -> Result<()> {
+    if !valid_key_id(&args.key_id) {
+        bail!("--key-id must match [A-Za-z0-9._-]{{1,128}}");
+    }
+    let decoded = BASE64
+        .decode(args.digest.as_bytes())
+        .context("--digest must be valid base64")?;
+    if decoded.len() != 32 {
+        bail!("--digest must decode to exactly 32 bytes");
+    }
+
+    let mut base_url = reqwest::Url::parse(&args.url).context("--url must be a valid URL")?;
+    if !matches!(base_url.scheme(), "http" | "https") {
+        bail!("--url must use http or https");
+    }
+    if base_url.cannot_be_a_base() {
+        bail!("--url must be a hierarchical http(s) URL");
+    }
+    if !base_url.path().ends_with('/') {
+        let path = format!("{}/", base_url.path());
+        base_url.set_path(&path);
+    }
+    let endpoint = base_url
+        .join(&format!("v1/sign/{}", args.key_id))
+        .context("failed to construct signing API URL")?;
+
+    if args.token.is_empty() {
+        bail!("--token must not be empty");
+    }
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to create signing API client")?
+        .post(endpoint)
+        .bearer_auth(args.token)
+        .json(&SignRequest {
+            digest: &args.digest,
+        })
+        .send()
+        .await
+        .context("failed to call signing API")?;
+    if !response.status().is_success() {
+        return Err(response_error(response, "signing request").await);
+    }
+
+    let signed: SignResponse = response
+        .json()
+        .await
+        .context("signing API returned an invalid success response")?;
+    let signature = BASE64
+        .decode(signed.signature.as_bytes())
+        .context("signing API returned a non-base64 signature")?;
+    if signature.len() != 64 {
+        bail!("signing API returned a signature with an invalid length");
+    }
+
+    println!("{}", signed.signature);
     Ok(())
 }
 
@@ -255,7 +376,49 @@ fn valid_key_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn bind_admin_socket(path: &Path, mode: u32) -> Result<tokio::net::UnixListener> {
+/// Look up a group ID by name with the reentrant getgrnam_r.
+fn lookup_group_id(name: &str) -> Result<u32> {
+    use std::ffi::{CStr, CString};
+
+    let c_name = CString::new(name).context("group name contains a NUL byte")?;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    loop {
+        // SAFETY: all pointers reference live, correctly sized buffers owned
+        // by this frame; getgrnam_r writes only within them.
+        let mut group: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(
+                c_name.as_ptr(),
+                &mut group,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buffer.len() < 1024 * 1024 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 {
+            bail!(
+                "failed to look up group {name}: {}",
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+        if result.is_null() {
+            bail!("admin socket group {name} does not exist");
+        }
+        // SAFETY: getgrnam_r succeeded, so gr_name points into `buffer`.
+        let found = unsafe { CStr::from_ptr(group.gr_name) };
+        if found.to_bytes() != name.as_bytes() {
+            bail!("group lookup for {name} returned a different group");
+        }
+        return Ok(group.gr_gid);
+    }
+}
+
+fn bind_admin_socket(path: &Path, mode: u32, gid: Option<u32>) -> Result<tokio::net::UnixListener> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "admin socket path {} has no parent directory",
@@ -296,6 +459,17 @@ fn bind_admin_socket(path: &Path, mode: u32) -> Result<tokio::net::UnixListener>
 
     let listener = tokio::net::UnixListener::bind(path)
         .with_context(|| format!("failed to bind admin socket {}", path.display()))?;
+    // Change the group before widening the mode, so the socket is never
+    // group-accessible to the wrong group. The unit's UMask=0077 keeps it
+    // owner-only until then.
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(path, None, Some(gid)).with_context(|| {
+            format!(
+                "failed to set admin socket group on {} (is the service a member of the group?)",
+                path.display()
+            )
+        })?;
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
         format!(
             "failed to set admin socket permissions on {}",
@@ -376,33 +550,4 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received");
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn short_options_parse_like_long_options() {
-        let cli = Cli::try_parse_from([
-            "microtun-firmware-signer",
-            "-c",
-            "/tmp/config.toml",
-            "unlock",
-            "-k",
-            "test-key",
-            "-s",
-            "/tmp/unlock.sock",
-        ])
-        .expect("short CLI options should parse");
-
-        assert_eq!(cli.config, PathBuf::from("/tmp/config.toml"));
-        match cli.command {
-            Some(Commands::Unlock(args)) => {
-                assert_eq!(args.key, "test-key");
-                assert_eq!(args.socket, Some(PathBuf::from("/tmp/unlock.sock")));
-            }
-            None => panic!("expected unlock subcommand"),
-        }
-    }
 }

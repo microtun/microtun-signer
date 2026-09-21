@@ -5,32 +5,92 @@ The package intentionally installs the systemd unit disabled and does not start
 it during installation. The installed /etc/microtun-firmware-signer/config.toml
 is an example configuration and must be reviewed before first use.
 
-The package creates the dedicated microtun-firmware-signer system user and group
-during configuration. If an encrypted signing key is stored under
-/etc/microtun-firmware-signer, a typical
+The package creates the dedicated microtun-firmware-signer system user and group,
+and a separate microtun-signer-operators group, during configuration. If an
+encrypted signing key is stored under /etc/microtun-firmware-signer, a typical
 secure ownership/mode is:
 
   root:microtun-firmware-signer 0640
 
-The application also enforces that encrypted key files are not group-writable
-and are not accessible by other users.
+Do not add operators to the microtun-firmware-signer group: that group can read
+the encrypted key file and the configuration. The application enforces that
+key files are regular files (not symlinks), are owned by root or the service
+user, are not group-writable, and are not accessible by other users.
+
+Keys must be encrypted with PBES2/AES-256 and a strong KDF; weaker files are
+refused at startup. For example:
+
+  openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
+    -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
+    -in plain-key.pem -out firmware-signing-key.encrypted.pem
+
+(PBKDF2-HMAC-SHA-256 with at least 600000 iterations is also accepted:
+-v2prf hmacWithSHA256 -iter 600000.)
 
 Signing-key passphrases are intentionally not systemd credentials. Every active
-key starts locked after service startup. The packaged unit creates
-/run/microtun-firmware-signer and the service exposes its local admin API
-at /run/microtun-firmware-signer/admin.sock. The socket defaults to mode 0660.
-Operators who need to unlock keys should be granted access to the service group,
-or invoke the unlock subcommand as an appropriately privileged user:
+key starts locked after service startup.
 
-  microtun-firmware-signer unlock --key microtun-firmware-prod
+Operator access
+---------------
+
+Two groups are involved, and they must stay separate:
+
+  microtun-firmware-signer   The service's own group. Can read the encrypted
+                             key file and config.toml. Only the service user
+                             belongs here.
+  microtun-signer-operators  People who unlock keys. Can reach the admin
+                             socket, nothing else.
+
+The pieces that connect them are all shipped by this package:
+
+  - postinst creates both groups (they are kept if the package is purged).
+  - The unit sets SupplementaryGroups=microtun-signer-operators, so the service
+    may hand its socket to that group, and RuntimeDirectoryMode=0751, so
+    operators can reach the socket without being able to list the directory.
+  - The example config sets Server.AdminSocketGroup = "microtun-signer-operators".
+    The service creates /run/microtun-firmware-signer/admin.sock as
+    microtun-firmware-signer:microtun-signer-operators, mode 0660.
+
+To grant a person operator rights:
+
+  adduser alice microtun-signer-operators
+
+Group membership only applies to new login sessions, so alice must log in
+again (or run `newgrp microtun-signer-operators`) before it takes effect. Then:
+
+  microtun-firmware-signer unlock --key-id microtun-firmware-prod
+
+To confirm the setup on a running service:
+
+  stat -c '%U:%G %a' /run/microtun-firmware-signer/admin.sock
+    -> microtun-firmware-signer:microtun-signer-operators 660
+  stat -c '%a' /run/microtun-firmware-signer
+    -> 751
+  getent group microtun-firmware-signer
+    -> the last field (members) should be empty
+
+To withdraw access: `deluser alice microtun-signer-operators`.
+
+The unlock subcommand uses the default socket path and does not read the service
+configuration unless --config is given explicitly, so operators need no access
+to /etc/microtun-firmware-signer. Human GitHub OAuth sessions exist only in
+process memory, so restarting the service invalidates them all (and relocks the
+signing keys):
+
+  systemctl restart microtun-firmware-signer.service
+  microtun-firmware-signer unlock --key-id microtun-firmware-prod
 
 The unlock subcommand reads the passphrase directly from the terminal with hidden
 input in Rust and never accepts the key passphrase as a command-line argument or
-environment variable.
+environment variable. The service decrypts one key at a time, on a worker thread
+separate from request handling, so an unlock does not stall signing requests.
 
-The GitHub OAuth client secret remains a systemd encrypted credential. The
-credential name matches GitHub.OAuthClientSecretCredential in the example
-configuration:
+GitHub OAuth client secret
+--------------------------
+
+The GitHub OAuth client secret is read only from a systemd credential; it is
+not accepted from environment variables or arbitrary file paths. The credential
+name matches GitHub.OAuthClientSecretCredential in the example configuration:
 
   LoadCredentialEncrypted=github-oauth-client-secret:/etc/credstore.encrypted/microtun-github-oauth-client-secret
 
@@ -39,12 +99,17 @@ drop-in instead of editing the packaged unit, for example:
 
   /etc/systemd/system/microtun-firmware-signer.service.d/credentials.conf
 
+To create the encrypted credential from a file containing the secret:
+
+  systemd-creds encrypt --name=github-oauth-client-secret \
+    secret.txt /etc/credstore.encrypted/microtun-github-oauth-client-secret
+
 After configuring the TOML, signing key file, and OAuth systemd credential:
 
   systemctl daemon-reload
   systemctl enable --now microtun-firmware-signer.service
-  microtun-firmware-signer unlock --key microtun-firmware-prod
+  microtun-firmware-signer unlock --key-id microtun-firmware-prod
   systemctl status microtun-firmware-signer.service
 
 The package installs /usr/bin/microtun-firmware-signer. The same binary provides
-the `unlock` subcommand.
+the `unlock` management subcommand and the `sign` public-API client subcommand.

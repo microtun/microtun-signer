@@ -9,12 +9,20 @@ Kind = "FirmwareSignerConfig"
 # at an internal reverse proxy or load balancer. Public routes are served from the
 # domain root (for example /healthz and /v1/sign/{key_id}).
 Listen = "127.0.0.1:8080"
+# Binding anything other than a loopback address is refused unless
+# AllowNonLoopbackListen = true is set: the signer speaks plain HTTP and bearer
+# credentials must only cross a TLS-protected path.
+# AllowNonLoopbackListen = false
+
 # Manual key unlocks use a separate local-only HTTP API over this Unix-domain
 # socket. Do not reverse-proxy or expose this socket. The packaged systemd unit
-# creates the parent RuntimeDirectory. 0660 allows the service owner/group to
-# run the unlock client; adjust group membership according to your operator model.
+# creates the parent RuntimeDirectory.
 AdminSocketPath = "/run/microtun-firmware-signer/admin.sock"
 AdminSocketMode = 0o660
+# Operators who unlock keys are members of this group only. It is deliberately
+# NOT the service group, so operators cannot read the encrypted key file or the
+# service configuration. The service must be a member (SupplementaryGroups=).
+AdminSocketGroup = "microtun-signer-operators"
 
 # This deployment uses one firmware signing key. The key ID is immutable and is
 # referenced by the signing URL and authorization policies below.
@@ -22,15 +30,22 @@ AdminSocketMode = 0o660
 ID = "microtun-firmware-prod"
 PEMPath = "/etc/microtun-firmware-signer/firmware-signing-key.encrypted.pem"
 State = "active"
+# The key must be encrypted with PBES2/AES-256 and either scrypt (r >= 8,
+# N*p >= 2^17) or PBKDF2-HMAC-SHA-256/512 with >= 600000 iterations, e.g.:
+#   openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
+#     -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 -in plain.pem -out encrypted.pem
 # No passphrase credential is configured here. Active keys always start locked;
-# an operator must run microtun-firmware-signer unlock --key <key-id> after each service start.
+# an operator must run microtun-firmware-signer unlock --key-id <key-id> after each service start.
 
 # Human identities authenticate through THIS signer's GitHub OAuth App.
 # Register an OAuth App in GitHub and set its Authorization callback URL to the
 # exact OAuthCallbackURL below. Keep the client secret outside this TOML file;
-# the service reads it from a systemd credential (or the documented env/file
-# fallback). No GitHub scopes are requested because public account identity is
-# enough to resolve the immutable numeric user ID.
+# the service reads it only from the systemd credential named below
+# ($CREDENTIALS_DIRECTORY/<name>).
+#
+# The signer requests the read:user scope so GitHub reports whether the account
+# has two-factor authentication enabled; accounts without 2FA are refused. The
+# GitHub token is revoked immediately after the lookup.
 [GitHub]
 APIURL = "https://api.github.com"
 APIVersion = "2026-03-10"
@@ -39,7 +54,9 @@ OAuthAccessTokenURL = "https://github.com/login/oauth/access_token"
 OAuthClientID = "Ov23liEXAMPLE"
 OAuthClientSecretCredential = "github-oauth-client-secret"
 OAuthCallbackURL = "https://signer.example.com/v1/auth/github/callback"
-OAuthSessionTTLSeconds = 28800
+# Human sessions sign without build provenance, so keep them short
+# (default 900, maximum 3600).
+OAuthSessionTTLSeconds = 900
 OAuthStateTTLSeconds = 600
 
 # GitHub Actions OIDC verifier infrastructure. Repository/workflow trust belongs
@@ -73,12 +90,19 @@ Repository = "owner/microtun"
 WorkflowPath = ".github/workflows/release.yml"
 AllowedEventNames = ["push"]
 AllowedRefTypes = ["tag"]
-# Strongly recommended when the release job uses a protected GitHub Environment.
+# Required for sign policies. Configure the environment's deployment rules to
+# allow only protected tags (and ideally required reviewers). Anyone who can
+# push a tag controls the workflow file at that tag, so the environment - not
+# tag creation - must be the signing gate.
 RequiredEnvironment = "firmware-signing"
+# Sign policies additionally require the tag to be protected by a GitHub
+# ruleset (the OIDC ref_protected claim). Add a tag ruleset for v* that
+# restricts creation, update and deletion.
 # Optional: require GitHub-hosted or self-hosted runners.
-# RequiredRunnerEnvironment = "self-hosted"
-# Optional: pin the release workflow revision(s).
-AllowedWorkflowSHAs = []
+# RequiredRunnerEnvironment = "github-hosted"
+# Optional: pin the release workflow revision(s) with full commit SHAs. Omit
+# the field to disable pinning; an empty list is rejected.
+# AllowedWorkflowSHAs = ["0123456789abcdef0123456789abcdef01234567"]
 
 [[Policy]]
 Identity = "firmware-maintainer"

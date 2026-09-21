@@ -16,6 +16,8 @@ use serde::Deserialize;
 
 const CONFIG_API_VERSION_ID: &str = "microtun.dev/v1alpha1";
 const CONFIG_KIND: &str = "FirmwareSignerConfig";
+/// Human sessions can sign without any build provenance, so keep them short.
+pub const MAX_OAUTH_SESSION_TTL_SECONDS: u64 = 60 * 60;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +56,15 @@ pub struct ServerConfig {
     pub admin_socket_path: PathBuf,
     #[serde(rename = "AdminSocketMode", default = "default_admin_socket_mode")]
     pub admin_socket_mode: u32,
+    /// Group given access to the admin socket. Keep this separate from the
+    /// service group so unlock operators cannot read the key file or config.
+    #[serde(rename = "AdminSocketGroup", default)]
+    pub admin_socket_group: Option<String>,
+    /// The API carries bearer credentials over plain HTTP and expects TLS to
+    /// be terminated by a local reverse proxy. Binding anything other than a
+    /// loopback address requires this explicit opt-in.
+    #[serde(rename = "AllowNonLoopbackListen", default)]
+    pub allow_non_loopback_listen: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +252,20 @@ impl Config {
             );
         }
 
+        if !self.server.listen.ip().is_loopback() && !self.server.allow_non_loopback_listen {
+            bail!(
+                "Server.Listen {} is not a loopback address; the signer speaks plain HTTP. Bind to loopback behind a TLS-terminating proxy, or set Server.AllowNonLoopbackListen = true if the network path is otherwise protected",
+                self.server.listen
+            );
+        }
+        if self
+            .server
+            .admin_socket_group
+            .as_deref()
+            .is_some_and(|group| !valid_group_name(group))
+        {
+            bail!("Server.AdminSocketGroup must be a valid POSIX group name");
+        }
         if !self.server.admin_socket_path.is_absolute() {
             bail!("Server.AdminSocketPath must be an absolute path");
         }
@@ -282,8 +307,9 @@ impl Config {
             "GitHub.OAuthAccessTokenURL",
             &self.github.oauth_access_token_url,
         )?;
-        if self.github.oauth_client_id.trim().is_empty() {
-            bail!("GitHub.OAuthClientID must not be empty");
+        // The client ID is also interpolated into the token revocation URL.
+        if !valid_key_id(&self.github.oauth_client_id) {
+            bail!("GitHub.OAuthClientID must match [A-Za-z0-9._-]{{1,128}}");
         }
         if !valid_credential_name(&self.github.oauth_client_secret_credential) {
             bail!("GitHub.OAuthClientSecretCredential must match [A-Za-z0-9._-]{{1,128}}");
@@ -297,9 +323,11 @@ impl Config {
             bail!("GitHub.OAuthCallbackURL path must be /v1/auth/github/callback");
         }
         if self.github.oauth_session_ttl_seconds == 0
-            || self.github.oauth_session_ttl_seconds > 24 * 60 * 60
+            || self.github.oauth_session_ttl_seconds > MAX_OAUTH_SESSION_TTL_SECONDS
         {
-            bail!("GitHub.OAuthSessionTTLSeconds must be between 1 and 86400 seconds");
+            bail!(
+                "GitHub.OAuthSessionTTLSeconds must be between 1 and {MAX_OAUTH_SESSION_TTL_SECONDS} seconds"
+            );
         }
         if self.github.oauth_state_ttl_seconds == 0 || self.github.oauth_state_ttl_seconds > 600 {
             bail!("GitHub.OAuthStateTTLSeconds must be between 1 and 600 seconds");
@@ -437,6 +465,28 @@ impl Config {
                         policy.identity
                     );
                 }
+                // Tag pushes run the workflow file from the tagged commit, so
+                // tag-creation rights alone must not confer signing rights. A
+                // protected GitHub Environment (deployment rules restricted to
+                // protected tags, optionally with required reviewers) is the
+                // gate; the protected-ref claim is additionally checked at
+                // signing time.
+                if identity.required_environment.is_none() {
+                    bail!(
+                        "sign policy for github-actions identity {} requires Identity.RequiredEnvironment (a protected GitHub Environment)",
+                        policy.identity
+                    );
+                }
+                if identity
+                    .allowed_ref_types
+                    .as_ref()
+                    .is_some_and(|types| types.iter().any(|value| value != "tag"))
+                {
+                    bail!(
+                        "sign policy for github-actions identity {} only permits AllowedRefTypes = [\"tag\"]",
+                        policy.identity
+                    );
+                }
             }
         }
 
@@ -496,12 +546,19 @@ fn validate_actions_identity(identity: &IdentityConfig) -> Result<()> {
     {
         bail!("Identity.RequiredRunnerEnvironment must not be empty when set");
     }
-    if identity
-        .allowed_workflow_shas
-        .as_ref()
-        .is_some_and(|values| values.iter().any(|value| value.trim().is_empty()))
-    {
-        bail!("Identity.AllowedWorkflowSHAs must not contain empty values");
+    if let Some(shas) = &identity.allowed_workflow_shas {
+        // An empty list would look like a pin while restricting nothing.
+        // Omit the field to disable pinning.
+        if shas.is_empty() {
+            bail!(
+                "Identity.AllowedWorkflowSHAs must not be empty; omit it to disable workflow pinning"
+            );
+        }
+        if shas.iter().any(|value| !valid_commit_sha(value)) {
+            bail!(
+                "Identity.AllowedWorkflowSHAs must contain full 40- or 64-character hex commit SHAs"
+            );
+        }
     }
     Ok(())
 }
@@ -536,6 +593,17 @@ pub fn valid_key_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+fn valid_commit_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn valid_group_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'_'))
+        && value.len() <= 32
+        && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
 fn valid_identity_id(value: &str) -> bool {
     valid_key_id(value)
 }
@@ -544,8 +612,10 @@ fn valid_credential_name(value: &str) -> bool {
     valid_key_id(value)
 }
 
+pub const DEFAULT_ADMIN_SOCKET_PATH: &str = "/run/microtun-firmware-signer/admin.sock";
+
 fn default_admin_socket_path() -> PathBuf {
-    PathBuf::from("/run/microtun-firmware-signer/admin.sock")
+    PathBuf::from(DEFAULT_ADMIN_SOCKET_PATH)
 }
 
 const fn default_admin_socket_mode() -> u32 {
@@ -573,7 +643,7 @@ fn default_github_oauth_client_secret_credential() -> String {
 }
 
 const fn default_oauth_session_ttl_seconds() -> u64 {
-    8 * 60 * 60
+    15 * 60
 }
 
 const fn default_oauth_state_ttl_seconds() -> u64 {
@@ -807,6 +877,7 @@ Repository = "owner/repo"
 WorkflowPath = ".github/workflows/release.yml"
 AllowedEventNames = ["push"]
 AllowedRefTypes = ["tag"]
+RequiredEnvironment = "firmware-signing"
 
 [[Policy]]
 Identity = "release-actions"
@@ -846,14 +917,15 @@ RepositoryID = "123"
 WorkflowPath = ".github/workflows/release.yml"
 AllowedEventNames = ["push"]
 AllowedRefTypes = ["tag"]
+RequiredEnvironment = "firmware-signing"
 
 [[Identity]]
-ID = "nightly-actions"
+ID = "hotfix-actions"
 Type = "github-actions"
 RepositoryID = "123"
-WorkflowPath = ".github/workflows/nightly.yml"
-AllowedEventNames = ["schedule"]
-AllowedRefTypes = ["branch"]
+WorkflowPath = ".github/workflows/hotfix.yml"
+AllowedEventNames = ["workflow_dispatch"]
+RequiredEnvironment = "firmware-signing"
 
 [[Policy]]
 Identity = "release-actions"
@@ -861,7 +933,7 @@ Actions = ["sign"]
 Keys = ["test-key"]
 
 [[Policy]]
-Identity = "nightly-actions"
+Identity = "hotfix-actions"
 Actions = ["sign"]
 Keys = ["test-key"]
 "#,
@@ -891,5 +963,128 @@ Keys = ["test-key"]
         );
         let mut config: Config = toml::from_str(&text).unwrap();
         assert!(config.normalize_and_validate().is_err());
+    }
+
+    fn actions_config(identity_extra: &str) -> String {
+        base_config(&format!(
+            r#"[[Identity]]
+ID = "release-actions"
+Type = "github-actions"
+RepositoryID = "123"
+WorkflowPath = ".github/workflows/release.yml"
+AllowedEventNames = ["push"]
+{identity_extra}
+
+[[Policy]]
+Identity = "release-actions"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#
+        ))
+    }
+
+    fn validate(text: &str) -> Result<Config> {
+        let mut config: Config = toml::from_str(text)?;
+        config.normalize_and_validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn actions_sign_policy_requires_protected_environment() {
+        let error = validate(&actions_config("")).unwrap_err().to_string();
+        assert!(error.contains("RequiredEnvironment"), "{error}");
+        validate(&actions_config(
+            r#"RequiredEnvironment = "firmware-signing""#,
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn actions_sign_policy_rejects_branch_ref_types() {
+        let error = validate(&actions_config(
+            "RequiredEnvironment = \"firmware-signing\"\nAllowedRefTypes = [\"tag\", \"branch\"]",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("AllowedRefTypes"), "{error}");
+    }
+
+    #[test]
+    fn empty_workflow_sha_pin_list_is_rejected() {
+        let env = "RequiredEnvironment = \"firmware-signing\"\n";
+        let error = validate(&actions_config(&format!("{env}AllowedWorkflowSHAs = []")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("AllowedWorkflowSHAs"), "{error}");
+        assert!(
+            validate(&actions_config(&format!(
+                "{env}AllowedWorkflowSHAs = [\"abc\"]"
+            )))
+            .is_err()
+        );
+        validate(&actions_config(&format!(
+            "{env}AllowedWorkflowSHAs = [\"{}\"]",
+            "a".repeat(40)
+        )))
+        .unwrap();
+    }
+
+    fn account_config() -> String {
+        base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#,
+        )
+    }
+
+    #[test]
+    fn oauth_session_ttl_defaults_short_and_is_capped() {
+        let config = validate(&account_config()).unwrap();
+        assert_eq!(config.github.oauth_session_ttl_seconds, 900);
+
+        let text = account_config().replace(
+            "[GitHubActions]",
+            "OAuthSessionTTLSeconds = 28800\n\n[GitHubActions]",
+        );
+        let error = validate(&text).unwrap_err().to_string();
+        assert!(error.contains("OAuthSessionTTLSeconds"), "{error}");
+    }
+
+    #[test]
+    fn non_loopback_listen_requires_opt_in() {
+        let text = account_config().replace("127.0.0.1:8080", "0.0.0.0:8080");
+        let error = validate(&text).unwrap_err().to_string();
+        assert!(error.contains("AllowNonLoopbackListen"), "{error}");
+
+        let text = text.replace(
+            "Listen = \"0.0.0.0:8080\"",
+            "Listen = \"0.0.0.0:8080\"\nAllowNonLoopbackListen = true",
+        );
+        validate(&text).unwrap();
+        validate(&account_config().replace("127.0.0.1:8080", "[::1]:8080")).unwrap();
+    }
+
+    #[test]
+    fn admin_socket_group_is_validated() {
+        let with_group = |group: &str| {
+            account_config().replace(
+                "Listen = \"127.0.0.1:8080\"",
+                &format!("Listen = \"127.0.0.1:8080\"\nAdminSocketGroup = \"{group}\""),
+            )
+        };
+        let config = validate(&with_group("microtun-signer-operators")).unwrap();
+        assert_eq!(
+            config.server.admin_socket_group.as_deref(),
+            Some("microtun-signer-operators")
+        );
+        assert!(validate(&with_group("../etc")).is_err());
+        assert!(validate(&with_group("")).is_err());
     }
 }

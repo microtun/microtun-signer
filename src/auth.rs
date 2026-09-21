@@ -1,31 +1,63 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use axum::http::{HeaderMap, header::AUTHORIZATION};
+use axum::http::{
+    HeaderMap,
+    header::{AUTHORIZATION, COOKIE},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::sync::RwLock;
-use ulid::Ulid;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use zeroize::Zeroizing;
 
 use crate::{
     config::{GithubActionsConfig, GithubConfig, IdentityConfig, IdentityKind},
-    key::load_required_secret,
+    key::load_systemd_credential,
 };
+
+type HmacSha256 = Hmac<Sha256>;
 
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const GITHUB_ACCOUNT_ISSUER: &str = "https://github.com";
 const MAX_BEARER_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_OAUTH_SESSIONS: usize = 4096;
-const MAX_PENDING_OAUTH_STATES: usize = 1024;
 
-pub const GITHUB_OAUTH_CLIENT_SECRET_ENV: &str = "MICROTUN_SIGNER_GITHUB_OAUTH_CLIENT_SECRET";
-pub const GITHUB_OAUTH_CLIENT_SECRET_FILE_ENV: &str =
-    "MICROTUN_SIGNER_GITHUB_OAUTH_CLIENT_SECRET_FILE";
+/// Upper bound on remembered GitHub Actions `jti` values. Entries are only
+/// recorded for tokens that already resolved to a configured identity, so
+/// this is not reachable by arbitrary GitHub users minting tokens for our
+/// audience in their own repositories.
+const MAX_SEEN_JTIS: usize = 65_536;
+const MAX_JTI_BYTES: usize = 256;
+const JWT_LEEWAY_SECONDS: u64 = 60;
+
+/// An unknown `kid` may trigger at most one JWKS fetch per interval. This
+/// stops unauthenticated callers from turning the signer into a request
+/// amplifier against GitHub (and getting it rate-limited).
+const JWKS_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// If GitHub's JWKS endpoint is unavailable, previously fetched keys remain
+/// usable for this long after their last successful fetch.
+const JWKS_MAX_STALENESS: Duration = Duration::from_secs(24 * 60 * 60);
+const JWKS_MAX_BYTES: usize = 256 * 1024;
+
+/// `__Host-` cookies must be Secure, Path=/ and have no Domain attribute,
+/// so they cannot be set or overwritten by sibling subdomains.
+pub const OAUTH_COOKIE_NAME: &str = "__Host-mts_oauth";
+/// `read:user` makes GitHub include `two_factor_authentication` in the
+/// `GET /user` response. The GitHub token is revoked immediately after use.
+const OAUTH_SCOPE: &str = "read:user";
+const OAUTH_STATE_MAC_LABEL: &[u8] = b"microtun-firmware-signer/oauth-state/v1";
+const OAUTH_PKCE_LABEL: &[u8] = b"microtun-firmware-signer/oauth-pkce/v1";
+const OAUTH_NONCE_BYTES: usize = 32;
+const OAUTH_COOKIE_BYTES: usize = 8 + OAUTH_NONCE_BYTES + 32;
+const SESSION_TOKEN_PREFIX: &str = "mts_";
 
 #[derive(Clone)]
 pub struct Authenticator {
@@ -39,13 +71,20 @@ struct Inner {
     identities: Vec<IdentityConfig>,
     http: reqwest::Client,
     jwks: RwLock<JwksCache>,
-    oauth_states: RwLock<HashMap<String, Instant>>,
-    oauth_sessions: RwLock<HashMap<String, GithubAccountSession>>,
+    /// Serialises JWKS refreshes so concurrent cache misses cause one fetch.
+    jwks_refresh: AsyncMutex<()>,
+    /// Per-process key authenticating the OAuth state cookie and deriving the
+    /// PKCE verifier. A restart only invalidates in-flight logins.
+    oauth_state_key: Zeroizing<[u8; 32]>,
+    /// Keyed by SHA-256 of the bearer token; raw session tokens are never stored.
+    oauth_sessions: RwLock<HashMap<[u8; 32], GithubAccountSession>>,
+    seen_jtis: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Default)]
 struct JwksCache {
     fetched_at: Option<Instant>,
+    last_attempt: Option<Instant>,
     keys: HashMap<String, RsaJwk>,
 }
 
@@ -78,6 +117,7 @@ pub struct GithubActionsClaims {
     pub iss: String,
     pub aud: Audience,
     pub sub: String,
+    pub exp: u64,
     pub jti: Option<String>,
     pub actor: Option<String>,
     pub actor_id: Option<String>,
@@ -86,6 +126,8 @@ pub struct GithubActionsClaims {
     #[serde(rename = "ref")]
     pub git_ref: String,
     pub ref_type: String,
+    /// GitHub has emitted this both as a JSON boolean and as "true"/"false".
+    pub ref_protected: Option<serde_json::Value>,
     pub sha: String,
     pub workflow_ref: String,
     pub workflow_sha: Option<String>,
@@ -116,13 +158,21 @@ impl Audience {
 struct GithubUserResponse {
     login: String,
     id: u64,
+    /// Only present in the private user response (requires `read:user`).
+    two_factor_authentication: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GithubOAuthTokenResponse {
     access_token: Option<String>,
     token_type: Option<String>,
+    scope: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GithubTokenRevocation<'a> {
+    access_token: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -139,9 +189,11 @@ pub struct GithubActionsIdentity {
     pub actor_id: Option<String>,
     pub git_ref: String,
     pub ref_type: String,
+    pub ref_protected: bool,
     pub sha: String,
     pub workflow_ref: String,
     pub event_name: String,
+    pub environment: Option<String>,
     pub run_id: String,
     pub run_attempt: String,
 }
@@ -166,6 +218,13 @@ pub struct AuthPrincipal {
     pub source: AuthSource,
 }
 
+/// Result of starting the GitHub OAuth flow: where to send the browser and
+/// the `Set-Cookie` value that binds the flow to that browser.
+pub struct OAuthStart {
+    pub authorize_url: String,
+    pub set_cookie: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct OAuthSessionGrant {
     pub access_token: String,
@@ -180,6 +239,10 @@ pub enum AuthError {
     TokenTooLarge,
     #[error("bearer token is invalid or expired")]
     InvalidToken,
+    #[error("GitHub Actions OIDC token has already been used")]
+    TokenReplayed,
+    #[error("GitHub Actions OIDC replay cache is unavailable")]
+    ReplayCacheUnavailable,
     #[error("GitHub Actions OIDC key discovery failed")]
     KeyDiscovery,
     #[error("GitHub identity provider is temporarily unavailable")]
@@ -190,20 +253,22 @@ pub enum AuthError {
 
 #[derive(Debug, Error)]
 pub enum OAuthFlowError {
-    #[error("GitHub OAuth state is invalid or expired")]
+    #[error("GitHub OAuth state is invalid, expired, or not bound to this browser")]
     InvalidState,
     #[error("GitHub OAuth authorization was denied")]
     AuthorizationDenied,
     #[error("GitHub OAuth code exchange failed")]
     ExchangeFailed,
+    #[error("GitHub OAuth token was not granted the required scope")]
+    ScopeNotGranted,
     #[error("GitHub identity provider is temporarily unavailable")]
     IdentityProviderUnavailable,
     #[error("authenticated GitHub account does not match a configured identity")]
     ClaimsDenied,
+    #[error("authenticated GitHub account does not have two-factor authentication enabled")]
+    TwoFactorRequired,
     #[error("too many OAuth sessions are active")]
     SessionCapacity,
-    #[error("too many OAuth login attempts are pending")]
-    StateCapacity,
 }
 
 impl Authenticator {
@@ -212,16 +277,17 @@ impl Authenticator {
         actions: GithubActionsConfig,
         identities: Vec<IdentityConfig>,
     ) -> anyhow::Result<Self> {
-        let github_oauth_client_secret = load_required_secret(
-            GITHUB_OAUTH_CLIENT_SECRET_ENV,
-            GITHUB_OAUTH_CLIENT_SECRET_FILE_ENV,
+        let github_oauth_client_secret = load_systemd_credential(
             &github.oauth_client_secret_credential,
             "GitHub OAuth client secret",
         )?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("microtun-firmware-signer/0.1")
+            .user_agent(concat!(
+                "microtun-firmware-signer/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -231,48 +297,66 @@ impl Authenticator {
                 identities,
                 http,
                 jwks: RwLock::new(JwksCache::default()),
-                oauth_states: RwLock::new(HashMap::new()),
+                jwks_refresh: AsyncMutex::new(()),
+                oauth_state_key: Zeroizing::new(random_bytes()),
                 oauth_sessions: RwLock::new(HashMap::new()),
+                seen_jtis: Mutex::new(HashMap::new()),
             }),
         })
     }
 
-    /// Start the signer's own GitHub OAuth web flow. The returned URL is the
-    /// only place a human account should obtain authorization for this service.
-    pub async fn github_oauth_authorize_url(&self) -> Result<String, OAuthFlowError> {
-        let now = Instant::now();
-        let mut states = self.inner.oauth_states.write().await;
-        let ttl = Duration::from_secs(self.inner.github.oauth_state_ttl_seconds);
-        states.retain(|_, created_at| now.duration_since(*created_at) < ttl);
-        if states.len() >= MAX_PENDING_OAUTH_STATES {
-            return Err(OAuthFlowError::StateCapacity);
-        }
-
-        let state = opaque_token("state_");
-        states.insert(state.clone(), now);
-        drop(states);
+    /// Start the signer's own GitHub OAuth web flow.
+    ///
+    /// No server-side state is kept, so unauthenticated callers cannot
+    /// exhaust login capacity. Instead the random state nonce is carried in
+    /// an HMAC-authenticated `__Host-` cookie, which binds the callback to
+    /// the browser that started the flow, and the PKCE verifier is derived
+    /// from that nonce with the server-side key so it never leaves the signer.
+    pub fn github_oauth_start(&self) -> Result<OAuthStart, OAuthFlowError> {
+        let nonce: [u8; OAUTH_NONCE_BYTES] = random_bytes();
+        let cookie_value = self.seal_oauth_cookie(unix_now(), &nonce);
+        let verifier = self.pkce_verifier(&nonce);
+        let challenge = B64URL.encode(Sha256::digest(verifier.as_bytes()));
 
         let mut url = reqwest::Url::parse(&self.inner.github.oauth_authorize_url)
             .map_err(|_| OAuthFlowError::IdentityProviderUnavailable)?;
         url.query_pairs_mut()
             .append_pair("client_id", &self.inner.github.oauth_client_id)
             .append_pair("redirect_uri", &self.inner.github.oauth_callback_url)
-            .append_pair("state", &state);
-        Ok(url.to_string())
+            .append_pair("scope", OAUTH_SCOPE)
+            .append_pair("state", &B64URL.encode(nonce))
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("allow_signup", "false");
+
+        Ok(OAuthStart {
+            authorize_url: url.into(),
+            set_cookie: format!(
+                "{OAUTH_COOKIE_NAME}={cookie_value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+                self.inner.github.oauth_state_ttl_seconds
+            ),
+        })
+    }
+
+    /// `Set-Cookie` value that removes the OAuth flow cookie.
+    pub fn oauth_clear_cookie() -> String {
+        format!("{OAUTH_COOKIE_NAME}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
     }
 
     /// Finish the signer's GitHub OAuth flow and mint a signer-local bearer
-    /// session. The GitHub access token is used once to resolve the account and
-    /// is never returned to the caller or retained in the session store.
+    /// session. The GitHub access token is used once to resolve the account,
+    /// then revoked at GitHub; it is never returned or retained.
     pub async fn complete_github_oauth(
         &self,
         code: &str,
         state: &str,
+        cookie_header: Option<&str>,
     ) -> Result<OAuthSessionGrant, OAuthFlowError> {
         if code.is_empty() || state.is_empty() {
             return Err(OAuthFlowError::AuthorizationDenied);
         }
-        self.consume_oauth_state(state).await?;
+        let nonce = self.verify_oauth_state(cookie_header, state)?;
+        let verifier = self.pkce_verifier(&nonce);
 
         let response = self
             .inner
@@ -290,6 +374,7 @@ impl Authenticator {
                     "redirect_uri",
                     self.inner.github.oauth_callback_url.as_str(),
                 ),
+                ("code_verifier", verifier.as_str()),
             ])
             .send()
             .await
@@ -310,49 +395,41 @@ impl Authenticator {
                 .access_token
                 .ok_or(OAuthFlowError::ExchangeFailed)?,
         );
-        if exchanged
-            .token_type
-            .as_deref()
-            .is_some_and(|value| !value.eq_ignore_ascii_case("bearer"))
-        {
-            return Err(OAuthFlowError::ExchangeFailed);
-        }
 
-        let user = self
-            .resolve_github_user(access_token.as_str())
-            .await
-            .map_err(|error| match error {
-                AuthError::ClaimsDenied => OAuthFlowError::ClaimsDenied,
-                AuthError::InvalidToken => OAuthFlowError::ExchangeFailed,
-                _ => OAuthFlowError::IdentityProviderUnavailable,
-            })?;
-        let user_id = user.id.to_string();
-        let identity = self
-            .inner
-            .identities
-            .iter()
-            .find(|identity| matches_github_account_identity(identity, &user_id, &user.login))
-            .ok_or(OAuthFlowError::ClaimsDenied)?;
+        // Whatever happens next, the GitHub token must not outlive this
+        // request: OAuth-app user tokens otherwise never expire.
+        let outcome = self
+            .github_account_from_token(
+                access_token.as_str(),
+                exchanged.token_type.as_deref(),
+                exchanged.scope.as_deref(),
+            )
+            .await;
+        self.revoke_github_token(access_token.as_str()).await;
+        let (identity_id, user) = outcome?;
 
         let now = Instant::now();
         let expires_in = self.inner.github.oauth_session_ttl_seconds;
         let session = GithubAccountSession {
             expires_at: now + Duration::from_secs(expires_in),
-            identity_id: identity.id.clone(),
-            user_id: user_id.clone(),
-            login: user.login.clone(),
+            identity_id,
+            user_id: user.id.to_string(),
+            login: user.login,
         };
-        let access_token = opaque_token("mts_");
+        let token = format!(
+            "{SESSION_TOKEN_PREFIX}{}",
+            B64URL.encode(random_bytes::<32>())
+        );
 
         let mut sessions = self.inner.oauth_sessions.write().await;
         sessions.retain(|_, session| session.expires_at > now);
         if sessions.len() >= MAX_OAUTH_SESSIONS {
             return Err(OAuthFlowError::SessionCapacity);
         }
-        sessions.insert(access_token.clone(), session);
+        sessions.insert(session_key(&token), session);
 
         Ok(OAuthSessionGrant {
-            access_token,
+            access_token: token,
             expires_in,
         })
     }
@@ -374,18 +451,19 @@ impl Authenticator {
         &self,
         token: &str,
     ) -> Result<AuthPrincipal, AuthError> {
-        if !token.starts_with("mts_") {
+        if !token.starts_with(SESSION_TOKEN_PREFIX) {
             return Err(AuthError::InvalidToken);
         }
 
         let now = Instant::now();
-        let mut sessions = self.inner.oauth_sessions.write().await;
-        sessions.retain(|_, session| session.expires_at > now);
-        let session = sessions
-            .get(token)
-            .cloned()
-            .ok_or(AuthError::InvalidToken)?;
-        drop(sessions);
+        let session = {
+            let sessions = self.inner.oauth_sessions.read().await;
+            sessions
+                .get(&session_key(token))
+                .filter(|session| session.expires_at > now)
+                .cloned()
+                .ok_or(AuthError::InvalidToken)?
+        };
 
         Ok(AuthPrincipal {
             identity_id: session.identity_id,
@@ -400,6 +478,45 @@ impl Authenticator {
                 login: session.login,
             }),
         })
+    }
+
+    /// Validate the exchanged GitHub token and resolve it to a configured
+    /// identity whose account has two-factor authentication enabled.
+    async fn github_account_from_token(
+        &self,
+        token: &str,
+        token_type: Option<&str>,
+        granted_scopes: Option<&str>,
+    ) -> Result<(String, GithubUserResponse), OAuthFlowError> {
+        if token_type.is_some_and(|value| !value.eq_ignore_ascii_case("bearer")) {
+            return Err(OAuthFlowError::ExchangeFailed);
+        }
+        if !scope_grants_read_user(granted_scopes) {
+            return Err(OAuthFlowError::ScopeNotGranted);
+        }
+
+        let user = self
+            .resolve_github_user(token)
+            .await
+            .map_err(|error| match error {
+                AuthError::ClaimsDenied => OAuthFlowError::ClaimsDenied,
+                AuthError::InvalidToken => OAuthFlowError::ExchangeFailed,
+                _ => OAuthFlowError::IdentityProviderUnavailable,
+            })?;
+        let user_id = user.id.to_string();
+        let identity = self
+            .inner
+            .identities
+            .iter()
+            .find(|identity| matches_github_account_identity(identity, &user_id, &user.login))
+            .ok_or(OAuthFlowError::ClaimsDenied)?;
+
+        // Fail closed: a missing field means GitHub returned the public
+        // profile only, so 2FA status is unknown.
+        if user.two_factor_authentication != Some(true) {
+            return Err(OAuthFlowError::TwoFactorRequired);
+        }
+        Ok((identity.id.clone(), user))
     }
 
     async fn resolve_github_user(&self, token: &str) -> Result<GithubUserResponse, AuthError> {
@@ -426,16 +543,103 @@ impl Authenticator {
             .map_err(|_| AuthError::IdentityProviderUnavailable)
     }
 
-    async fn consume_oauth_state(&self, state: &str) -> Result<(), OAuthFlowError> {
-        let now = Instant::now();
-        let ttl = Duration::from_secs(self.inner.github.oauth_state_ttl_seconds);
-        let mut states = self.inner.oauth_states.write().await;
-        states.retain(|_, created_at| now.duration_since(*created_at) < ttl);
-        let created_at = states.remove(state).ok_or(OAuthFlowError::InvalidState)?;
-        if now.duration_since(created_at) >= ttl {
+    /// Best-effort revocation of a GitHub OAuth token via
+    /// `DELETE /applications/{client_id}/token`.
+    async fn revoke_github_token(&self, token: &str) {
+        let github = &self.inner.github;
+        let result = self
+            .inner
+            .http
+            .delete(format!(
+                "{}/applications/{}/token",
+                github.api_url, github.oauth_client_id
+            ))
+            .basic_auth(
+                &github.oauth_client_id,
+                Some(self.inner.github_oauth_client_secret.as_str()),
+            )
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", &github.api_version)
+            .json(&GithubTokenRevocation {
+                access_token: token,
+            })
+            .send()
+            .await;
+        match result {
+            Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => {}
+            Ok(response) => tracing::warn!(
+                status = response.status().as_u16(),
+                "failed to revoke GitHub OAuth token after identity lookup"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to revoke GitHub OAuth token after identity lookup"
+            ),
+        }
+    }
+
+    fn state_mac(&self) -> HmacSha256 {
+        let mut mac = HmacSha256::new_from_slice(self.inner.oauth_state_key.as_slice())
+            .expect("HMAC accepts any key length");
+        mac.update(OAUTH_STATE_MAC_LABEL);
+        mac
+    }
+
+    fn seal_oauth_cookie(&self, issued_at: u64, nonce: &[u8; OAUTH_NONCE_BYTES]) -> String {
+        let mut payload = Vec::with_capacity(OAUTH_COOKIE_BYTES);
+        payload.extend_from_slice(&issued_at.to_be_bytes());
+        payload.extend_from_slice(nonce);
+        let mut mac = self.state_mac();
+        mac.update(&payload);
+        payload.extend_from_slice(&mac.finalize().into_bytes());
+        B64URL.encode(payload)
+    }
+
+    fn pkce_verifier(&self, nonce: &[u8; OAUTH_NONCE_BYTES]) -> Zeroizing<String> {
+        let mut mac = HmacSha256::new_from_slice(self.inner.oauth_state_key.as_slice())
+            .expect("HMAC accepts any key length");
+        mac.update(OAUTH_PKCE_LABEL);
+        mac.update(nonce);
+        // 32 bytes -> 43 base64url characters: within RFC 7636's 43..=128.
+        Zeroizing::new(B64URL.encode(mac.finalize().into_bytes()))
+    }
+
+    fn verify_oauth_state(
+        &self,
+        cookie_header: Option<&str>,
+        state: &str,
+    ) -> Result<[u8; OAUTH_NONCE_BYTES], OAuthFlowError> {
+        let value = cookie_header
+            .and_then(|header| find_cookie(header, OAUTH_COOKIE_NAME))
+            .ok_or(OAuthFlowError::InvalidState)?;
+        let raw = B64URL
+            .decode(value)
+            .map_err(|_| OAuthFlowError::InvalidState)?;
+        if raw.len() != OAUTH_COOKIE_BYTES {
             return Err(OAuthFlowError::InvalidState);
         }
-        Ok(())
+        let (payload, tag) = raw.split_at(8 + OAUTH_NONCE_BYTES);
+        let mut mac = self.state_mac();
+        mac.update(payload);
+        mac.verify_slice(tag)
+            .map_err(|_| OAuthFlowError::InvalidState)?;
+
+        let issued_at = u64::from_be_bytes(payload[..8].try_into().expect("8-byte prefix"));
+        let now = unix_now();
+        if issued_at > now.saturating_add(JWT_LEEWAY_SECONDS)
+            || now.saturating_sub(issued_at) >= self.inner.github.oauth_state_ttl_seconds
+        {
+            return Err(OAuthFlowError::InvalidState);
+        }
+
+        let nonce: [u8; OAUTH_NONCE_BYTES] = payload[8..].try_into().expect("nonce-sized suffix");
+        let presented = B64URL
+            .decode(state)
+            .map_err(|_| OAuthFlowError::InvalidState)?;
+        if presented.len() != OAUTH_NONCE_BYTES || !bool::from(presented.ct_eq(&nonce)) {
+            return Err(OAuthFlowError::InvalidState);
+        }
+        Ok(nonce)
     }
 
     async fn authenticate_github_actions(&self, token: &str) -> Result<AuthPrincipal, AuthError> {
@@ -450,17 +654,29 @@ impl Authenticator {
             .map_err(|_| AuthError::KeyDiscovery)?;
 
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.leeway = 60;
+        validation.leeway = JWT_LEEWAY_SECONDS;
         validation.validate_nbf = true;
         validation.set_audience(&[actions.audience.as_str()]);
         validation.set_issuer(&[GITHUB_ACTIONS_ISSUER]);
+        // jsonwebtoken only understands exp/nbf/iss/aud/sub here; `jti` is
+        // required explicitly below.
         validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud", "sub"]);
 
         let data = decode::<GithubActionsClaims>(token, &decoding_key, &validation)
             .map_err(|_| AuthError::InvalidToken)?;
         let claims = data.claims;
+        let jti = claims
+            .jti
+            .clone()
+            .filter(|jti| !jti.is_empty() && jti.len() <= MAX_JTI_BYTES)
+            .ok_or(AuthError::InvalidToken)?;
         let identity = resolve_github_actions_identity(&self.inner.identities, &claims)?;
 
+        // One-time use: record only after the token resolved to a configured
+        // identity, so foreign tokens cannot fill the replay cache.
+        self.record_jti(&jti, claims.exp)?;
+
+        let ref_protected = claim_is_true(claims.ref_protected.as_ref());
         Ok(AuthPrincipal {
             identity_id: identity.id.clone(),
             principal_key: format!("github-actions:repository:{}", claims.repository_id),
@@ -468,7 +684,7 @@ impl Authenticator {
             issuer: claims.iss.clone(),
             audience: Some(claims.aud.as_audit_string()),
             subject: claims.sub.clone(),
-            jti: claims.jti.clone(),
+            jti: Some(jti),
             source: AuthSource::GithubActions(Box::new(GithubActionsIdentity {
                 repository: claims.repository,
                 repository_id: claims.repository_id,
@@ -476,36 +692,97 @@ impl Authenticator {
                 actor_id: claims.actor_id,
                 git_ref: claims.git_ref,
                 ref_type: claims.ref_type,
+                ref_protected,
                 sha: claims.sha,
                 workflow_ref: claims.workflow_ref,
                 event_name: claims.event_name,
+                environment: claims.environment,
                 run_id: claims.run_id,
                 run_attempt: claims.run_attempt,
             })),
         })
     }
 
+    fn record_jti(&self, jti: &str, exp: u64) -> Result<(), AuthError> {
+        let now = Instant::now();
+        let remaining = exp
+            .saturating_sub(unix_now())
+            .saturating_add(JWT_LEEWAY_SECONDS);
+        let mut seen = self
+            .inner
+            .seen_jtis
+            .lock()
+            .map_err(|_| AuthError::ReplayCacheUnavailable)?;
+        seen.retain(|_, until| *until > now);
+        if seen.contains_key(jti) {
+            return Err(AuthError::TokenReplayed);
+        }
+        if seen.len() >= MAX_SEEN_JTIS {
+            return Err(AuthError::ReplayCacheUnavailable);
+        }
+        seen.insert(jti.to_owned(), now + Duration::from_secs(remaining));
+        Ok(())
+    }
+
+    async fn cached_jwk(&self, kid: &str, ttl: Duration) -> Option<RsaJwk> {
+        let cache = self.inner.jwks.read().await;
+        let fresh = cache.fetched_at.is_some_and(|at| at.elapsed() < ttl);
+        if fresh {
+            cache.keys.get(kid).cloned()
+        } else {
+            None
+        }
+    }
+
     async fn jwk_for(&self, kid: &str) -> Result<RsaJwk, AuthError> {
-        let actions = &self.inner.actions;
-        {
-            let cache = self.inner.jwks.read().await;
-            let fresh = cache
-                .fetched_at
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(actions.jwks_ttl_seconds));
-            if fresh {
-                if let Some(key) = cache.keys.get(kid) {
-                    return Ok(key.clone());
+        let ttl = Duration::from_secs(self.inner.actions.jwks_ttl_seconds);
+        if let Some(key) = self.cached_jwk(kid, ttl).await {
+            return Ok(key);
+        }
+
+        // Single-flight: one task refreshes, the rest wait and re-check.
+        let _refresh = self.inner.jwks_refresh.lock().await;
+        if let Some(key) = self.cached_jwk(kid, ttl).await {
+            return Ok(key);
+        }
+
+        let may_fetch = {
+            let mut cache = self.inner.jwks.write().await;
+            let allowed = cache
+                .last_attempt
+                .is_none_or(|at| at.elapsed() >= JWKS_MIN_REFRESH_INTERVAL);
+            if allowed {
+                cache.last_attempt = Some(Instant::now());
+            }
+            allowed
+        };
+        if may_fetch {
+            match self.fetch_jwks().await {
+                Ok(keys) => {
+                    let mut cache = self.inner.jwks.write().await;
+                    cache.keys = keys;
+                    cache.fetched_at = Some(Instant::now());
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "GitHub Actions JWKS refresh failed");
                 }
             }
         }
 
-        self.refresh_jwks().await?;
         let cache = self.inner.jwks.read().await;
+        let usable = cache
+            .fetched_at
+            .is_some_and(|at| at.elapsed() < ttl.saturating_add(JWKS_MAX_STALENESS));
+        if !usable {
+            return Err(AuthError::KeyDiscovery);
+        }
+        // An unknown kid against a usable key set is a bad token, not an
+        // outage: answer 401 without another fetch until the interval passes.
         cache.keys.get(kid).cloned().ok_or(AuthError::InvalidToken)
     }
 
-    async fn refresh_jwks(&self) -> Result<(), AuthError> {
-        let response = self
+    async fn fetch_jwks(&self) -> Result<HashMap<String, RsaJwk>, AuthError> {
+        let mut response = self
             .inner
             .http
             .get(&self.inner.actions.jwks_url)
@@ -517,14 +794,25 @@ impl Authenticator {
 
         if response
             .content_length()
-            .is_some_and(|length| length > 256 * 1024)
+            .is_some_and(|length| length > JWKS_MAX_BYTES as u64)
         {
             return Err(AuthError::KeyDiscovery);
         }
-        let document = response
-            .json::<JwksDocument>()
+        // Enforce the size limit while streaming, so chunked responses
+        // without Content-Length are bounded too.
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| AuthError::KeyDiscovery)?;
+            .map_err(|_| AuthError::KeyDiscovery)?
+        {
+            if body.len() + chunk.len() > JWKS_MAX_BYTES {
+                return Err(AuthError::KeyDiscovery);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let document: JwksDocument =
+            serde_json::from_slice(&body).map_err(|_| AuthError::KeyDiscovery)?;
 
         let mut keys = HashMap::new();
         for key in document.keys {
@@ -537,18 +825,85 @@ impl Authenticator {
         if keys.is_empty() {
             return Err(AuthError::KeyDiscovery);
         }
-
-        let mut cache = self.inner.jwks.write().await;
-        cache.keys = keys;
-        cache.fetched_at = Some(Instant::now());
-        Ok(())
+        Ok(keys)
     }
 }
 
-fn opaque_token(prefix: &str) -> String {
-    // Each ULID contributes 80 random bits in addition to its timestamp. Two
-    // independent ULIDs therefore provide 160 random bits for bearer/state use.
-    format!("{prefix}{}_{}", Ulid::new(), Ulid::new())
+#[cfg(test)]
+impl Authenticator {
+    pub(crate) fn for_tests_with_state_ttl(state_ttl: u64) -> Self {
+        let github: GithubConfig = toml::from_str(&format!(
+            r#"OAuthClientID = "Iv1.test"
+OAuthCallbackURL = "https://signer.example/v1/auth/github/callback"
+OAuthStateTTLSeconds = {state_ttl}
+"#
+        ))
+        .expect("test GitHub config");
+        let actions: GithubActionsConfig = toml::from_str("").expect("test Actions config");
+        Self {
+            inner: Arc::new(Inner {
+                github,
+                github_oauth_client_secret: Zeroizing::new("secret".into()),
+                actions,
+                identities: Vec::new(),
+                http: reqwest::Client::new(),
+                jwks: RwLock::new(JwksCache::default()),
+                jwks_refresh: AsyncMutex::new(()),
+                oauth_state_key: Zeroizing::new(random_bytes()),
+                oauth_sessions: RwLock::new(HashMap::new()),
+                seen_jtis: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+}
+
+/// Fill a fixed-size buffer from the operating system CSPRNG.
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0_u8; N];
+    getrandom::fill(&mut bytes).expect("operating system random number generator failed");
+    bytes
+}
+
+fn session_key(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+fn claim_is_true(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(text)) => text == "true",
+        _ => false,
+    }
+}
+
+/// GitHub reports granted OAuth scopes as a comma-separated list. `user`
+/// implies `read:user`.
+fn scope_grants_read_user(scopes: Option<&str>) -> bool {
+    scopes.is_some_and(|scopes| {
+        scopes
+            .split([',', ' '])
+            .map(str::trim)
+            .any(|scope| scope == OAUTH_SCOPE || scope == "user")
+    })
+}
+
+fn find_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').find_map(|pair| {
+        let (key, value) = pair.trim().split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
+/// Extract the Cookie header for the OAuth callback.
+pub fn cookie_header(headers: &HeaderMap) -> Option<&str> {
+    headers.get(COOKIE).and_then(|value| value.to_str().ok())
 }
 
 fn is_github_actions_jwt(token: &str) -> bool {
@@ -724,13 +1079,15 @@ mod tests {
             iss: GITHUB_ACTIONS_ISSUER.into(),
             aud: Audience::One("aud".into()),
             sub: "repo:owner/repo:ref:refs/tags/v1.2.3".into(),
-            jti: None,
+            exp: 4_102_444_800,
+            jti: Some("jti-1".into()),
             actor: Some("release-user".into()),
             actor_id: Some("456".into()),
             repository: "owner/repo".into(),
             repository_id: "123".into(),
             git_ref: "refs/tags/v1.2.3".into(),
             ref_type: "tag".into(),
+            ref_protected: Some(serde_json::Value::Bool(true)),
             sha: "0123456789abcdef".into(),
             workflow_ref: "owner/repo/.github/workflows/release.yml@refs/tags/v1.2.3".into(),
             workflow_sha: Some("fedcba9876543210".into()),
@@ -799,11 +1156,192 @@ mod tests {
         ));
     }
 
+    fn test_authenticator(state_ttl: u64) -> Authenticator {
+        Authenticator::for_tests_with_state_ttl(state_ttl)
+    }
+
+    fn start_flow(auth: &Authenticator) -> (String, String, String) {
+        let start = auth.github_oauth_start().unwrap();
+        let url = reqwest::Url::parse(&start.authorize_url).unwrap();
+        let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        let cookie = start.set_cookie.split(';').next().unwrap().to_owned();
+        (
+            query["state"].clone(),
+            query["code_challenge"].clone(),
+            cookie,
+        )
+    }
+
     #[test]
-    fn signer_session_tokens_are_not_github_tokens() {
-        let token = opaque_token("mts_");
-        assert!(token.starts_with("mts_"));
-        assert!(token.len() > 50);
-        assert_eq!(token.split('.').count(), 1);
+    fn oauth_start_requests_read_user_with_pkce_and_host_cookie() {
+        let auth = test_authenticator(600);
+        let start = auth.github_oauth_start().unwrap();
+        let url = reqwest::Url::parse(&start.authorize_url).unwrap();
+        let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["scope"], "read:user");
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert!(start.set_cookie.starts_with("__Host-mts_oauth="));
+        for attribute in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+            assert!(start.set_cookie.contains(attribute));
+        }
+        assert!(!start.set_cookie.contains("Domain"));
+    }
+
+    #[test]
+    fn oauth_state_is_bound_to_the_issuing_browser_cookie() {
+        let auth = test_authenticator(600);
+        let (state, challenge, cookie) = start_flow(&auth);
+        let nonce = auth.verify_oauth_state(Some(&cookie), &state).unwrap();
+
+        // The PKCE verifier re-derived at callback time matches the challenge.
+        let verifier = auth.pkce_verifier(&nonce);
+        assert_eq!(
+            B64URL.encode(Sha256::digest(verifier.as_bytes())),
+            challenge
+        );
+
+        // Missing cookie, another browser's cookie, or a tampered cookie fail.
+        assert!(auth.verify_oauth_state(None, &state).is_err());
+        let (_, _, other_cookie) = start_flow(&auth);
+        assert!(
+            auth.verify_oauth_state(Some(&other_cookie), &state)
+                .is_err()
+        );
+        let mut tampered = cookie.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(auth.verify_oauth_state(Some(&tampered), &state).is_err());
+
+        // Cookies from another signer process (different key) are rejected.
+        let other_process = test_authenticator(600);
+        assert!(
+            other_process
+                .verify_oauth_state(Some(&cookie), &state)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_state_cookie_expires() {
+        let auth = test_authenticator(1);
+        let nonce = [7_u8; OAUTH_NONCE_BYTES];
+        let cookie = format!(
+            "{OAUTH_COOKIE_NAME}={}",
+            auth.seal_oauth_cookie(unix_now() - 5, &nonce)
+        );
+        assert!(
+            auth.verify_oauth_state(Some(&cookie), &B64URL.encode(nonce))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn find_cookie_picks_the_named_cookie() {
+        let header = "a=1; __Host-mts_oauth=abc; b=2";
+        assert_eq!(find_cookie(header, OAUTH_COOKIE_NAME), Some("abc"));
+        assert_eq!(
+            find_cookie("x__Host-mts_oauth=abc", OAUTH_COOKIE_NAME),
+            None
+        );
+    }
+
+    #[test]
+    fn read_user_scope_is_required() {
+        assert!(scope_grants_read_user(Some("read:user")));
+        assert!(scope_grants_read_user(Some("gist,user")));
+        assert!(!scope_grants_read_user(Some("")));
+        assert!(!scope_grants_read_user(Some("read:org")));
+        assert!(!scope_grants_read_user(None));
+    }
+
+    #[tokio::test]
+    async fn session_tokens_are_random_and_stored_hashed() {
+        let auth = test_authenticator(600);
+        let token = format!(
+            "{SESSION_TOKEN_PREFIX}{}",
+            B64URL.encode(random_bytes::<32>())
+        );
+        assert_eq!(token.len(), 4 + 43);
+        auth.inner.oauth_sessions.write().await.insert(
+            session_key(&token),
+            GithubAccountSession {
+                expires_at: Instant::now() + Duration::from_secs(60),
+                identity_id: "maintainer".into(),
+                user_id: "42".into(),
+                login: "octocat".into(),
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        assert!(auth.authenticate(&headers).await.is_ok());
+        assert!(
+            !auth
+                .inner
+                .oauth_sessions
+                .read()
+                .await
+                .keys()
+                .any(|key| key.as_slice() == token.as_bytes())
+        );
+    }
+
+    #[test]
+    fn github_actions_jti_is_single_use() {
+        let auth = test_authenticator(600);
+        let exp = unix_now() + 300;
+        auth.record_jti("abc", exp).unwrap();
+        assert!(matches!(
+            auth.record_jti("abc", exp),
+            Err(AuthError::TokenReplayed)
+        ));
+        auth.record_jti("def", exp).unwrap();
+    }
+
+    #[test]
+    fn ref_protected_accepts_bool_or_string() {
+        use serde_json::Value;
+        assert!(claim_is_true(Some(&Value::Bool(true))));
+        assert!(claim_is_true(Some(&Value::String("true".into()))));
+        assert!(!claim_is_true(Some(&Value::String("false".into()))));
+        assert!(!claim_is_true(Some(&Value::Bool(false))));
+        assert!(!claim_is_true(None));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_does_not_refetch_within_the_refresh_interval() {
+        let auth = test_authenticator(600);
+        {
+            let mut cache = auth.inner.jwks.write().await;
+            cache.fetched_at = Some(Instant::now());
+            cache.last_attempt = Some(Instant::now());
+        }
+        // A fetch would fail in this sandboxed test (and report KeyDiscovery);
+        // an immediate InvalidToken shows no fetch was attempted.
+        assert!(matches!(
+            auth.jwk_for("unknown-kid").await,
+            Err(AuthError::InvalidToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_keys_are_served_when_refresh_is_not_allowed() {
+        let auth = test_authenticator(600);
+        {
+            let mut cache = auth.inner.jwks.write().await;
+            cache.fetched_at = Instant::now().checked_sub(Duration::from_secs(7200));
+            cache.last_attempt = Some(Instant::now());
+            cache.keys.insert(
+                "kid".into(),
+                RsaJwk {
+                    kty: "RSA".into(),
+                    kid: "kid".into(),
+                    alg: Some("RS256".into()),
+                    n: "AQAB".into(),
+                    e: "AQAB".into(),
+                    use_: Some("sig".into()),
+                },
+            );
+        }
+        assert!(auth.jwk_for("kid").await.is_ok());
     }
 }
