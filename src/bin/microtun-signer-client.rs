@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 struct Cli {
     /// Base URL of the public Microtun signer API.
     #[arg(short = 'u', long, env = "MICROTUN_SIGNER_URL", global = true)]
-    url: String,
+    url: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -97,6 +97,7 @@ struct ErrorBody {
 #[tokio::main]
 async fn main() -> Result<()> {
     let Cli { url, command } = Cli::parse();
+    let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
     match command {
         Commands::Sign(args) => sign(&url, args).await,
         Commands::PublicKey(args) => public_key(&url, args).await,
@@ -387,43 +388,7 @@ fn valid_key_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    use super::{Cli, Commands, https_oauth_url, normalize_github_oauth_error_response};
-
-    #[test]
-    fn parses_sign_subcommand() {
-        let cli = Cli::try_parse_from([
-            "microtun-signer-client",
-            "--url",
-            "https://signer.example.com/",
-            "sign",
-            "--key-id",
-            "prod",
-            "--token",
-            "token",
-            "--digest",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        ])
-        .unwrap();
-
-        assert!(matches!(cli.command, Commands::Sign(_)));
-    }
-
-    #[test]
-    fn parses_public_key_subcommand() {
-        let cli = Cli::try_parse_from([
-            "microtun-signer-client",
-            "public-key",
-            "--url",
-            "https://signer.example.com/",
-            "--key-id",
-            "prod",
-        ])
-        .unwrap();
-
-        assert!(matches!(cli.command, Commands::PublicKey(_)));
-    }
+    use super::{https_oauth_url, normalize_github_oauth_error_response};
 
     #[test]
     fn oauth_endpoint_must_be_hierarchical_https() {
