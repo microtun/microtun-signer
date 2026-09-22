@@ -1,8 +1,10 @@
 mod api;
 mod auth;
 mod authorization;
+mod client;
 mod config;
 mod key;
+mod session_cache;
 
 use std::{
     fs,
@@ -48,14 +50,27 @@ struct Cli {
     #[arg(short = 'c', long, env = "MICROTUN_SIGNER_CONFIG", global = true)]
     config: Option<PathBuf>,
 
+    /// Base URL of the public Microtun signer API.
+    #[arg(short = 'u', long, env = "MICROTUN_SIGNER_URL", global = true)]
+    url: Option<String>,
+
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run the signer service.
+    Serve,
+
     /// Interactively unlock an active signing key.
     Unlock(UnlockArgs),
+
+    /// Sign a 32-byte MCUboot SHA-256 firmware digest.
+    Sign(client::SignArgs),
+
+    /// Get the PEM-encoded public key for a signing key.
+    PublicKey(client::PublicKeyArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -90,10 +105,24 @@ struct ErrorBody {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Cli { config, command } = Cli::parse();
+    let Cli {
+        config,
+        url,
+        command,
+    } = Cli::parse();
     match command {
-        Some(Commands::Unlock(args)) => unlock(args, config.as_deref()).await,
-        None => run_server(config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))).await,
+        Commands::Serve => {
+            run_server(config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))).await
+        }
+        Commands::Unlock(args) => unlock(args, config.as_deref()).await,
+        Commands::Sign(args) => {
+            let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
+            client::sign(&url, args).await
+        }
+        Commands::PublicKey(args) => {
+            let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
+            client::public_key(&url, args).await
+        }
     }
 }
 

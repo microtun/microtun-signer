@@ -20,8 +20,6 @@ endif
 override_dh_auto_install:
 	install -D -m 0755 target/release/microtun-signer \
 		debian/microtun-signer/usr/bin/microtun-signer
-	install -D -m 0755 target/release/microtun-signer-client \
-		debian/microtun-signer/usr/bin/microtun-signer-client
 	install -D -m 0640 config.example.toml \
 		debian/microtun-signer/etc/microtun-signer/config.toml
 	install -D -m 0644 deploy/microtun-signer.service \

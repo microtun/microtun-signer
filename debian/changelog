@@ -1,8 +1,14 @@
-microtun-signer (0.5.1) UNRELEASED; urgency=medium
+microtun-signer (0.6.0) UNRELEASED; urgency=medium
+
+  * Consolidate all the commands 
+
+ -- Damian Peckett <damian@pecke.tt>  Wed, 23 Sep 2026 00:58:12 +0200
+
+microtun-signer (0.5.1) unstable; urgency=medium
 
   * Cache github user tokens 
 
- -- Damian Peckett <damian@pecke.tt>  Wed, 23 Sep 2026 00:01:14 +0200
+ -- Damian Peckett <damian@pecke.tt>  Wed, 23 Sep 2026 00:58:01 +0200
 
 microtun-signer (0.5.0) unstable; urgency=medium
 

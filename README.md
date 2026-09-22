@@ -35,7 +35,7 @@ openssl genpkey -algorithm ED25519 | openssl pkcs8 -topk8 \
 ## Run the service
 
 ```bash
-./target/release/microtun-signer
+./target/release/microtun-signer serve
 ```
 
 The GitHub OAuth client secret is read from a systemd credential via
@@ -60,9 +60,8 @@ The passphrase is entered interactively and is not accepted through command-line
 ### GitHub user
 
 ```bash
-./target/release/microtun-signer-client \
+./target/release/microtun-signer sign \
   --url https://signer.example.com/ \
-  sign \
   --github-login \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
@@ -74,27 +73,25 @@ Enable **Device Flow** in the GitHub OAuth App.
 
 ```bash
 MICROTUN_SIGNER_TOKEN="$TOKEN" \
-  ./target/release/microtun-signer-client \
+  ./target/release/microtun-signer sign \
   --url https://signer.example.com/ \
-  sign \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```
 
 `MICROTUN_SIGNER_URL` can be used instead of `--url`.
 
-On success, the client writes only the base64 Ed25519 signature to stdout.
+On success, the command writes only the base64 Ed25519 signature to stdout.
 
 ## Get a public key
 
 ```bash
-./target/release/microtun-signer-client \
+./target/release/microtun-signer public-key \
   --url https://signer.example.com/ \
-  public-key \
   --key-id microtun-firmware-prod
 ```
 
-On success, the client writes the PEM-encoded Ed25519 public key to stdout. The signing key must be unlocked before its public key is available.
+On success, the command writes the PEM-encoded Ed25519 public key to stdout. The signing key must be unlocked before its public key is available.
 
 ## API
 

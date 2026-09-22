@@ -14,7 +14,7 @@ RuntimeDirectory=microtun-signer
 # Operators are not in the service group, so they need search (x) permission
 # to reach the socket. The socket itself is 0660 service-user:operators.
 RuntimeDirectoryMode=0751
-ExecStart=/usr/bin/microtun-signer
+ExecStart=/usr/bin/microtun-signer serve
 Restart=on-failure
 RestartSec=2s
 UMask=0077

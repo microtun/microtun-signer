@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use clap::{Parser, Subcommand};
+use clap::Args;
 use oauth2::basic::BasicClient;
 use oauth2::{
     ClientId, DeviceAuthorizationUrl, Scope, StandardDeviceAuthorizationResponse, TokenResponse,
@@ -11,30 +11,10 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use microtun_signer::session_cache;
+use crate::{session_cache, valid_key_id};
 
-#[derive(Debug, Parser)]
-#[command(name = "microtun-signer-client", version)]
-struct Cli {
-    /// Base URL of the public Microtun signer API.
-    #[arg(short = 'u', long, env = "MICROTUN_SIGNER_URL", global = true)]
-    url: Option<String>,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Debug, Subcommand)]
-enum Commands {
-    /// Sign a 32-byte MCUboot SHA-256 firmware digest.
-    Sign(SignArgs),
-
-    /// Get the PEM-encoded public key for a signing key.
-    PublicKey(PublicKeyArgs),
-}
-
-#[derive(Debug, clap::Args)]
-struct SignArgs {
+#[derive(Debug, Args)]
+pub struct SignArgs {
     /// Immutable signing key ID to use.
     #[arg(short = 'k', long = "key-id")]
     key_id: String,
@@ -47,7 +27,7 @@ struct SignArgs {
     /// Authenticate as a GitHub user, reusing a cached signer session when
     /// available. If login is required, GitHub's OAuth device flow is used.
     /// This takes precedence over MICROTUN_SIGNER_TOKEN/--token.
-    #[arg(long = "github-login", alias = "github-device")]
+    #[arg(long = "github-login")]
     github_login: bool,
 
     /// 32-byte MCUboot SHA-256 digest encoded as base64.
@@ -55,8 +35,8 @@ struct SignArgs {
     digest: String,
 }
 
-#[derive(Debug, clap::Args)]
-struct PublicKeyArgs {
+#[derive(Debug, Args)]
+pub struct PublicKeyArgs {
     /// Immutable signing key ID to fetch.
     #[arg(short = 'k', long = "key-id")]
     key_id: String,
@@ -97,17 +77,7 @@ struct ErrorBody {
     request_id: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let Cli { url, command } = Cli::parse();
-    let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
-    match command {
-        Commands::Sign(args) => sign(&url, args).await,
-        Commands::PublicKey(args) => public_key(&url, args).await,
-    }
-}
-
-async fn sign(url: &str, args: SignArgs) -> Result<()> {
+pub async fn sign(url: &str, args: SignArgs) -> Result<()> {
     validate_key_id(&args.key_id)?;
     let decoded = BASE64
         .decode(args.digest.as_bytes())
@@ -180,7 +150,7 @@ async fn sign(url: &str, args: SignArgs) -> Result<()> {
     Ok(())
 }
 
-async fn public_key(url: &str, args: PublicKeyArgs) -> Result<()> {
+pub async fn public_key(url: &str, args: PublicKeyArgs) -> Result<()> {
     validate_key_id(&args.key_id)?;
 
     let base_url = signer_base_url(url)?;
@@ -255,10 +225,7 @@ fn public_api_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!(
-            "microtun-signer-client/",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(concat!("microtun-signer/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to create Microtun signer API client")
 }
@@ -426,14 +393,6 @@ async fn response_error(response: reqwest::Response, action: &str) -> anyhow::Er
         },
         Err(error) => anyhow::anyhow!("{action} failed with HTTP status {status}: {error}"),
     }
-}
-
-fn valid_key_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
