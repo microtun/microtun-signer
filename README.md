@@ -136,3 +136,14 @@ cargo test --all-targets --locked
 - Restarting the service locks all keys again and invalidates local human sessions.
 - GitHub Actions signing policies are configured in `config.toml`; start from `config.example.toml`.
 - Release tags must be `vX.Y.Z` and match both `Cargo.toml` and `debian/changelog`.
+
+## License
+
+This project is proprietary source-available software.
+
+The source is published for transparency, review, and evaluation. It is not
+open-source software.
+
+Commercial or production use requires a separate written license.
+
+See [LICENSE](LICENSE) for details.

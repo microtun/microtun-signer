@@ -1,8 +1,8 @@
-microtun-signer (0.5.0) UNRELEASED; urgency=medium
+microtun-signer (0.5.0) unstable; urgency=medium
 
   * Rename project 
 
- -- Damian Peckett <damian@pecke.tt>  Tue, 22 Sep 2026 18:32:09 +0200
+ -- Damian Peckett <damian@pecke.tt>  Tue, 22 Sep 2026 22:02:49 +0200
 
 microtun-signer (0.4.0) unstable; urgency=medium
 
