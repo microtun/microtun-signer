@@ -24,6 +24,9 @@ jobs:
       - name: Check compilation
         run: cargo +1.98.1 check --all-targets --locked
 
+      - name: Build release binaries
+        run: cargo +1.98.1 build --release --locked --bins
+
       - name: Run Clippy
         run: cargo +1.98.1 clippy --all-targets --locked -- -D warnings
 
