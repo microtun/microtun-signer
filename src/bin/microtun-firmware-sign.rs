@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +12,8 @@ use oauth2::{
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
+
+use common::session_cache;
 
 #[derive(Debug, Parser)]
 #[command(name = "microtun-firmware-sign", version)]
@@ -27,8 +31,9 @@ struct Cli {
     #[arg(long, env = "MICROTUN_SIGNER_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// Authenticate interactively with GitHub's OAuth device flow. This takes
-    /// precedence over MICROTUN_SIGNER_TOKEN/--token.
+    /// Authenticate with GitHub's OAuth device flow, reusing a cached signer
+    /// session when available. This takes precedence over
+    /// MICROTUN_SIGNER_TOKEN/--token.
     #[arg(long)]
     github_device: bool,
 
@@ -94,28 +99,45 @@ async fn sign(args: Cli) -> Result<()> {
         .context("failed to construct signing API URL")?;
     let client = public_api_client()?;
 
-    let token = if args.github_device {
-        github_device_login(&client, &base_url).await?
+    let (mut token, reused_cached_session) = if args.github_device {
+        let cached = match session_cache::load(&base_url) {
+            Ok(cached) => cached,
+            Err(error) => {
+                eprintln!("Warning: could not read signer session cache: {error:#}");
+                None
+            }
+        };
+        match cached {
+            Some(token) => {
+                eprintln!("Reusing cached signer session.");
+                (token, true)
+            }
+            None => (github_device_login(&client, &base_url).await?, false),
+        }
     } else if let Some(token) = args.token {
         if token.is_empty() {
             bail!("--token must not be empty");
         }
-        Zeroizing::new(token)
+        (Zeroizing::new(token), false)
     } else {
         bail!(
             "no bearer credential was provided; set MICROTUN_SIGNER_TOKEN/--token, or pass --github-device for interactive GitHub authentication"
         );
     };
 
-    let response = client
-        .post(endpoint)
-        .bearer_auth(token.as_str())
-        .json(&SignRequest {
-            digest: &args.digest,
-        })
-        .send()
-        .await
-        .context("failed to call signing API")?;
+    let mut response =
+        send_signing_request(&client, &endpoint, token.as_str(), &args.digest).await?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        && args.github_device
+        && reused_cached_session
+    {
+        if let Err(error) = session_cache::remove(&base_url) {
+            eprintln!("Warning: could not remove stale signer session cache: {error:#}");
+        }
+        eprintln!("Cached signer session is no longer accepted; authenticating with GitHub again.");
+        token = github_device_login(&client, &base_url).await?;
+        response = send_signing_request(&client, &endpoint, token.as_str(), &args.digest).await?;
+    }
     if !response.status().is_success() {
         return Err(response_error(response, "signing request").await);
     }
@@ -133,6 +155,21 @@ async fn sign(args: Cli) -> Result<()> {
 
     println!("{}", signed.signature);
     Ok(())
+}
+
+async fn send_signing_request(
+    client: &reqwest::Client,
+    endpoint: &reqwest::Url,
+    token: &str,
+    digest: &str,
+) -> Result<reqwest::Response> {
+    client
+        .post(endpoint.clone())
+        .bearer_auth(token)
+        .json(&SignRequest { digest })
+        .send()
+        .await
+        .context("failed to call signing API")
 }
 
 fn signer_base_url(value: &str) -> Result<reqwest::Url> {
@@ -256,11 +293,26 @@ async fn github_device_login(
     if session.access_token.is_empty() || session.expires_in == 0 {
         bail!("signer returned an invalid OAuth session");
     }
+    let cached =
+        match session_cache::store(signer_base_url, &session.access_token, session.expires_in) {
+            Ok(cached) => cached,
+            Err(error) => {
+                eprintln!("Warning: could not cache signer session: {error:#}");
+                false
+            }
+        };
 
-    eprintln!(
-        "GitHub authentication complete; signer session is valid for {} seconds.",
-        session.expires_in
-    );
+    if cached {
+        eprintln!(
+            "GitHub authentication complete; signer session is valid for {} seconds and was cached locally.",
+            session.expires_in
+        );
+    } else {
+        eprintln!(
+            "GitHub authentication complete; signer session is valid for {} seconds.",
+            session.expires_in
+        );
+    }
     Ok(Zeroizing::new(session.access_token))
 }
 

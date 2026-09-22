@@ -26,9 +26,10 @@ The private key must be encrypted PKCS#8.
 Example:
 
 ```bash
-openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
-  -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
-  -in plain-key.pem -out firmware-signing-key.encrypted.pem
+openssl genpkey -algorithm ED25519 | openssl pkcs8 -topk8 \
+  -v2 aes-256-cbc \
+  -scrypt -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
+  -out firmware-signing-key.encrypted.pem
 ```
 
 ## Run the service
