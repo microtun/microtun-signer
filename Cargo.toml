@@ -5,6 +5,14 @@ edition = "2024"
 rust-version = "1.98"
 publish = false
 
+[[bin]]
+name = "microtun-firmware-signer"
+path = "src/main.rs"
+
+[[bin]]
+name = "microtun-firmware-sign"
+path = "src/bin/microtun-firmware-sign.rs"
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"

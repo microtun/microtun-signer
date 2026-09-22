@@ -20,6 +20,8 @@ endif
 override_dh_auto_install:
 	install -D -m 0755 target/release/microtun-firmware-signer \
 		debian/microtun-firmware-signer/usr/bin/microtun-firmware-signer
+	install -D -m 0755 target/release/microtun-firmware-sign \
+		debian/microtun-firmware-signer/usr/bin/microtun-firmware-sign
 	install -D -m 0640 config.example.toml \
 		debian/microtun-firmware-signer/etc/microtun-firmware-signer/config.toml
 	install -D -m 0644 deploy/microtun-firmware-signer.service \

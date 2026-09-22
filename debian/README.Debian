@@ -111,5 +111,6 @@ After configuring the TOML, signing key file, and OAuth systemd credential:
   microtun-firmware-signer unlock --key-id microtun-firmware-prod
   systemctl status microtun-firmware-signer.service
 
-The package installs /usr/bin/microtun-firmware-signer. The same binary provides
-the `unlock` management subcommand and the `sign` public-API client subcommand.
+The package installs /usr/bin/microtun-firmware-signer for the service and its
+`unlock` management subcommand, plus /usr/bin/microtun-firmware-sign as the
+standalone public-API signing client.

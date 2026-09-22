@@ -51,31 +51,31 @@ All keys start locked on service startup, and only keys with `State = "active"` 
   unlock -k microtun-firmware-prod
 ```
 
-The unlock passphrase is read from the terminal with hidden input; it is not accepted as a command-line argument, environment variable, or systemd credential. CLI short options are `-c` for `--config`, `-k` for `--key-id`, `-s` for `--socket`, `-u` for `--url`, and `-d` for `--digest`. `MICROTUN_SIGNER_ADMIN_SOCKET` may be used instead of `--socket`. The `unlock` subcommand uses the default admin socket path and only reads the service config when `--config` (or `MICROTUN_SIGNER_CONFIG`) is given explicitly.
+The unlock passphrase is read from the terminal with hidden input; it is not accepted as a command-line argument, environment variable, or systemd credential. Service/admin CLI short options are `-c` for `--config`, `-k` for `--key-id`, and `-s` for `--socket`. The signing client uses `-k` for `--key-id`, `-u` for `--url`, and `-d` for `--digest`. `MICROTUN_SIGNER_ADMIN_SOCKET` may be used instead of `--socket`. The `unlock` subcommand uses the default admin socket path and only reads the service config when `--config` (or `MICROTUN_SIGNER_CONFIG`) is given explicitly.
 
-The binary can also act as a client for the public signing API. Human GitHub users authenticate explicitly with `--github-device`; the command starts GitHub's OAuth device flow, prints the verification URL/code to stderr, exchanges the resulting GitHub token for a short-lived signer-local session, and then performs the signing request:
+The separate `microtun-firmware-sign` binary is the minimal client for the public signing API. Human GitHub users authenticate explicitly with `--github-device`; the command starts GitHub's OAuth device flow, prints the verification URL/code to stderr, exchanges the resulting GitHub token for a short-lived signer-local session, and then performs the signing request:
 
 ```bash
-./target/release/microtun-firmware-signer sign \
+./target/release/microtun-firmware-sign \
   --github-device \
   --url https://signer.example.com/ \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```
 
-Enable **Device Flow** in the GitHub OAuth App settings. `--github-device` takes precedence over `MICROTUN_SIGNER_TOKEN`/`--token`. Without either an explicit bearer credential or `--github-device`, `sign` fails instead of unexpectedly becoming interactive. The CLI never receives the OAuth client secret. The signer verifies that the temporary GitHub token was issued to its configured OAuth App, requires a configured account with 2FA, revokes the GitHub token, and only then returns a short-lived signer-local session. RFC 8628 device authorization and the polling loop are handled by the `oauth2` crate, with the CLI preserving GitHub's required wait before the first token poll and normalizing GitHub's HTTP-200 OAuth error responses for the crate; GitHub-specific token verification, identity policy, replay protection, and revocation remain signer-side.
+Enable **Device Flow** in the GitHub OAuth App settings. `--github-device` takes precedence over `MICROTUN_SIGNER_TOKEN`/`--token`. Without either an explicit bearer credential or `--github-device`, the client fails instead of unexpectedly becoming interactive. The CLI never receives the OAuth client secret. The signer verifies that the temporary GitHub token was issued to its configured OAuth App, requires a configured account with 2FA, revokes the GitHub token, and only then returns a short-lived signer-local session. RFC 8628 device authorization and the polling loop are handled by the `oauth2` crate, with the CLI preserving GitHub's required wait before the first token poll and normalizing GitHub's HTTP-200 OAuth error responses for the crate; GitHub-specific token verification, identity policy, replay protection, and revocation remain signer-side.
 
 Automation can continue to pass an existing bearer credential through `MICROTUN_SIGNER_TOKEN` to avoid putting it in process arguments:
 
 ```bash
 MICROTUN_SIGNER_TOKEN="$TOKEN" \
-  ./target/release/microtun-firmware-signer sign \
+  ./target/release/microtun-firmware-sign \
   --url https://signer.example.com/ \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```
 
-`MICROTUN_SIGNER_URL` may be used instead of `--url`. The bearer credential can be a signer-local human session or a GitHub Actions OIDC JWT that satisfies the configured identity constraints. On success, `sign` writes only the base64 Ed25519 signature to stdout; device-flow instructions are written to stderr, so stdout remains suitable for scripts.
+`MICROTUN_SIGNER_URL` may be used instead of `--url`. The bearer credential can be a signer-local human session or a GitHub Actions OIDC JWT that satisfies the configured identity constraints. On success, `microtun-firmware-sign` writes only the base64 Ed25519 signature to stdout; device-flow instructions are written to stderr, so stdout remains suitable for scripts.
 
 On Debian/systemd deployments, use the packaged systemd credential for the GitHub OAuth client secret; the example unit and `debian/README.Debian` document the expected layout and operator-group setup.
 
