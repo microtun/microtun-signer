@@ -1,4 +1,4 @@
-//! Loading and validating the firmware signer TOML configuration.
+//! Loading and validating the Microtun signer TOML configuration.
 //!
 //! Authentication proves a configured identity. Authorization policies then
 //! grant those identities operations on immutable signing keys. GitHub account
@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 const CONFIG_API_VERSION_ID: &str = "microtun.dev/v1alpha1";
-const CONFIG_KIND: &str = "FirmwareSignerConfig";
+const CONFIG_KIND: &str = "SignerConfig";
 /// Human sessions can sign without any build provenance, so keep them short.
 pub const MAX_OAUTH_SESSION_TTL_SECONDS: u64 = 60 * 60;
 
@@ -597,7 +597,7 @@ fn valid_credential_name(value: &str) -> bool {
     valid_key_id(value)
 }
 
-pub const DEFAULT_ADMIN_SOCKET_PATH: &str = "/run/microtun-firmware-signer/admin.sock";
+pub const DEFAULT_ADMIN_SOCKET_PATH: &str = "/run/microtun-signer/admin.sock";
 
 fn default_admin_socket_path() -> PathBuf {
     PathBuf::from(DEFAULT_ADMIN_SOCKET_PATH)
@@ -632,7 +632,7 @@ const fn default_oauth_session_ttl_seconds() -> u64 {
 }
 
 fn default_audience() -> String {
-    "microtun-firmware-signer".to_owned()
+    "microtun-signer".to_owned()
 }
 
 fn default_jwks_url() -> String {
@@ -651,7 +651,7 @@ mod tests {
         format!(
             r#"[Microtun]
 ApiVersion = "microtun.dev/v1alpha1"
-Kind = "FirmwareSignerConfig"
+Kind = "SignerConfig"
 
 [Server]
 Listen = "127.0.0.1:8080"
@@ -696,7 +696,7 @@ Keys = ["test-key"]
         config.normalize_and_validate().unwrap();
         assert_eq!(
             config.server.admin_socket_path,
-            PathBuf::from("/run/microtun-firmware-signer/admin.sock")
+            PathBuf::from("/run/microtun-signer/admin.sock")
         );
         assert_eq!(config.server.admin_socket_mode, 0o660);
     }
@@ -717,7 +717,7 @@ Keys = ["test-key"]
         )
         .replace(
             "Listen = \"127.0.0.1:8080\"",
-            "Listen = \"127.0.0.1:8080\"\nSocketPath = \"/run/microtun-firmware-signer/unlock.sock\"\nSocketMode = 0o660",
+            "Listen = \"127.0.0.1:8080\"\nSocketPath = \"/run/microtun-signer/unlock.sock\"\nSocketMode = 0o660",
         );
         let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
         assert!(error.contains("SocketPath") || error.contains("SocketMode"));
@@ -737,7 +737,7 @@ Actions = ["sign"]
 Keys = ["test-key"]
 
 [Unlock]
-SocketPath = "/run/microtun-firmware-signer/unlock.sock"
+SocketPath = "/run/microtun-signer/unlock.sock"
 "#,
         );
         let error = toml::from_str::<Config>(&text).unwrap_err().to_string();

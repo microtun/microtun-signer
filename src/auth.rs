@@ -319,7 +319,7 @@ impl Authenticator {
             .timeout(Duration::from_secs(8))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!(
-                "microtun-firmware-signer/",
+                "microtun-signer/",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()?;

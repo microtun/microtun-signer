@@ -1,13 +1,13 @@
 #!/bin/sh
 set -e
 
-SERVICE_USER="microtun-firmware-signer"
-SERVICE_GROUP="microtun-firmware-signer"
+SERVICE_USER="microtun-signer"
+SERVICE_GROUP="microtun-signer"
 # Operators who unlock keys join this group only. It grants access to the
 # admin socket, but not to the key file and configuration, which
 # belong to the service group.
 OPERATOR_GROUP="microtun-signer-operators"
-CONFIG_DIR="/etc/microtun-firmware-signer"
+CONFIG_DIR="/etc/microtun-signer"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 
 case "$1" in
@@ -31,7 +31,7 @@ case "$1" in
                 --home /nonexistent \
                 --no-create-home \
                 --disabled-login \
-                --gecos "Microtun firmware signer" \
+                --gecos "Microtun signer" \
                 "$SERVICE_USER"
         fi
 

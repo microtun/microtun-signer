@@ -1,18 +1,18 @@
-microtun-firmware-signer for Debian
+microtun-signer for Debian
 ====================================
 
 The package intentionally installs the systemd unit disabled and does not start
-it during installation. The installed /etc/microtun-firmware-signer/config.toml
+it during installation. The installed /etc/microtun-signer/config.toml
 is an example configuration and must be reviewed before first use.
 
-The package creates the dedicated microtun-firmware-signer system user and group,
+The package creates the dedicated microtun-signer system user and group,
 and a separate microtun-signer-operators group, during configuration. If an
-encrypted signing key is stored under /etc/microtun-firmware-signer, a typical
+encrypted signing key is stored under /etc/microtun-signer, a typical
 secure ownership/mode is:
 
-  root:microtun-firmware-signer 0640
+  root:microtun-signer 0640
 
-Do not add operators to the microtun-firmware-signer group: that group can read
+Do not add operators to the microtun-signer group: that group can read
 the encrypted key file and the configuration. The application enforces that
 key files are regular files (not symlinks), are owned by root or the service
 user, are not group-writable, and are not accessible by other users.
@@ -35,7 +35,7 @@ Operator access
 
 Two groups are involved, and they must stay separate:
 
-  microtun-firmware-signer   The service's own group. Can read the encrypted
+  microtun-signer   The service's own group. Can read the encrypted
                              key file and config.toml. Only the service user
                              belongs here.
   microtun-signer-operators  People who unlock keys. Can reach the admin
@@ -48,8 +48,8 @@ The pieces that connect them are all shipped by this package:
     may hand its socket to that group, and RuntimeDirectoryMode=0751, so
     operators can reach the socket without being able to list the directory.
   - The example config sets Server.AdminSocketGroup = "microtun-signer-operators".
-    The service creates /run/microtun-firmware-signer/admin.sock as
-    microtun-firmware-signer:microtun-signer-operators, mode 0660.
+    The service creates /run/microtun-signer/admin.sock as
+    microtun-signer:microtun-signer-operators, mode 0660.
 
 To grant a person operator rights:
 
@@ -58,27 +58,27 @@ To grant a person operator rights:
 Group membership only applies to new login sessions, so alice must log in
 again (or run `newgrp microtun-signer-operators`) before it takes effect. Then:
 
-  microtun-firmware-signer unlock --key-id microtun-firmware-prod
+  microtun-signer unlock --key-id microtun-firmware-prod
 
 To confirm the setup on a running service:
 
-  stat -c '%U:%G %a' /run/microtun-firmware-signer/admin.sock
-    -> microtun-firmware-signer:microtun-signer-operators 660
-  stat -c '%a' /run/microtun-firmware-signer
+  stat -c '%U:%G %a' /run/microtun-signer/admin.sock
+    -> microtun-signer:microtun-signer-operators 660
+  stat -c '%a' /run/microtun-signer
     -> 751
-  getent group microtun-firmware-signer
+  getent group microtun-signer
     -> the last field (members) should be empty
 
 To withdraw access: `deluser alice microtun-signer-operators`.
 
 The unlock subcommand uses the default socket path and does not read the service
 configuration unless --config is given explicitly, so operators need no access
-to /etc/microtun-firmware-signer. Human GitHub OAuth sessions exist only in
+to /etc/microtun-signer. Human GitHub OAuth sessions exist only in
 process memory, so restarting the service invalidates them all (and relocks the
 signing keys):
 
-  systemctl restart microtun-firmware-signer.service
-  microtun-firmware-signer unlock --key-id microtun-firmware-prod
+  systemctl restart microtun-signer.service
+  microtun-signer unlock --key-id microtun-firmware-prod
 
 The unlock subcommand reads the passphrase directly from the terminal with hidden
 input in Rust and never accepts the key passphrase as a command-line argument or
@@ -97,7 +97,7 @@ name matches GitHub.OAuthClientSecretCredential in the example configuration:
 Deployment-specific credential mappings should normally be placed in a systemd
 drop-in instead of editing the packaged unit, for example:
 
-  /etc/systemd/system/microtun-firmware-signer.service.d/credentials.conf
+  /etc/systemd/system/microtun-signer.service.d/credentials.conf
 
 To create the encrypted credential from a file containing the secret:
 
@@ -107,10 +107,10 @@ To create the encrypted credential from a file containing the secret:
 After configuring the TOML, signing key file, and OAuth systemd credential:
 
   systemctl daemon-reload
-  systemctl enable --now microtun-firmware-signer.service
-  microtun-firmware-signer unlock --key-id microtun-firmware-prod
-  systemctl status microtun-firmware-signer.service
+  systemctl enable --now microtun-signer.service
+  microtun-signer unlock --key-id microtun-firmware-prod
+  systemctl status microtun-signer.service
 
-The package installs /usr/bin/microtun-firmware-signer for the service and its
-`unlock` management subcommand, plus /usr/bin/microtun-firmware-sign as the
-standalone public-API signing client.
+The package installs /usr/bin/microtun-signer for the service and its
+`unlock` management subcommand, plus /usr/bin/microtun-signer-client as
+the standalone public-API client for signing and retrieving public keys.

@@ -1,4 +1,4 @@
-Source: microtun-firmware-signer
+Source: microtun-signer
 Section: admin
 Priority: optional
 Maintainer: Local Package Builder <root@localhost>
@@ -9,7 +9,7 @@ Build-Depends:
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
-Package: microtun-firmware-signer
+Package: microtun-signer
 Architecture: any
 Depends:
  ${shlibs:Depends},

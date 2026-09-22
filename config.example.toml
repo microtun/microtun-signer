@@ -1,8 +1,8 @@
-# microtun firmware signer - identity/policy example configuration.
+# microtun signer - identity/policy example configuration.
 
 [Microtun]
 ApiVersion = "microtun.dev/v1alpha1"
-Kind = "FirmwareSignerConfig"
+Kind = "SignerConfig"
 
 [Server]
 # Bind the Rust process only to loopback/private networking. Terminate HTTPS/mTLS
@@ -17,7 +17,7 @@ Listen = "127.0.0.1:8080"
 # Manual key unlocks use a separate local-only HTTP API over this Unix-domain
 # socket. Do not reverse-proxy or expose this socket. The packaged systemd unit
 # creates the parent RuntimeDirectory.
-AdminSocketPath = "/run/microtun-firmware-signer/admin.sock"
+AdminSocketPath = "/run/microtun-signer/admin.sock"
 AdminSocketMode = 0o660
 # Operators who unlock keys are members of this group only. It is deliberately
 # NOT the service group, so operators cannot read the encrypted key file or the
@@ -28,14 +28,14 @@ AdminSocketGroup = "microtun-signer-operators"
 # referenced by the signing URL and authorization policies below.
 [[Key]]
 ID = "microtun-firmware-prod"
-PEMPath = "/etc/microtun-firmware-signer/firmware-signing-key.encrypted.pem"
+PEMPath = "/etc/microtun-signer/firmware-signing-key.encrypted.pem"
 State = "active"
 # The key must be encrypted with PBES2/AES-256 and either scrypt (r >= 8,
 # N*p >= 2^17) or PBKDF2-HMAC-SHA-256/512 with >= 600000 iterations, e.g.:
 #   openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
 #     -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 -in plain.pem -out encrypted.pem
 # No passphrase credential is configured here. Active keys always start locked;
-# an operator must run microtun-firmware-signer unlock --key-id <key-id> after each service start.
+# an operator must run microtun-signer unlock --key-id <key-id> after each service start.
 
 # Human identities authenticate through THIS signer's GitHub OAuth App using
 # GitHub's device flow. Enable Device Flow in the OAuth App settings. Keep the
@@ -59,7 +59,7 @@ OAuthSessionTTLSeconds = 900
 # GitHub Actions OIDC verifier infrastructure. Repository/workflow trust belongs
 # to the github-actions Identity below, not to this verifier block.
 [GitHubActions]
-Audience = "microtun-firmware-signer"
+Audience = "microtun-signer"
 JWKSURL = "https://token.actions.githubusercontent.com/.well-known/jwks"
 JWKSTTLSeconds = 3600
 

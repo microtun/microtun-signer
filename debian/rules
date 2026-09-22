@@ -18,22 +18,22 @@ ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 endif
 
 override_dh_auto_install:
-	install -D -m 0755 target/release/microtun-firmware-signer \
-		debian/microtun-firmware-signer/usr/bin/microtun-firmware-signer
-	install -D -m 0755 target/release/microtun-firmware-sign \
-		debian/microtun-firmware-signer/usr/bin/microtun-firmware-sign
+	install -D -m 0755 target/release/microtun-signer \
+		debian/microtun-signer/usr/bin/microtun-signer
+	install -D -m 0755 target/release/microtun-signer-client \
+		debian/microtun-signer/usr/bin/microtun-signer-client
 	install -D -m 0640 config.example.toml \
-		debian/microtun-firmware-signer/etc/microtun-firmware-signer/config.toml
-	install -D -m 0644 deploy/microtun-firmware-signer.service \
-		debian/microtun-firmware-signer/usr/lib/systemd/system/microtun-firmware-signer.service
+		debian/microtun-signer/etc/microtun-signer/config.toml
+	install -D -m 0644 deploy/microtun-signer.service \
+		debian/microtun-signer/usr/lib/systemd/system/microtun-signer.service
 
 override_dh_fixperms:
 	dh_fixperms
 	# dh_fixperms resets conffiles to 0644. Keep the configuration directory
 	# and file private from unpack onwards; postinst hands them to the service
 	# group once that group exists.
-	chmod 0750 debian/microtun-firmware-signer/etc/microtun-firmware-signer
-	chmod 0640 debian/microtun-firmware-signer/etc/microtun-firmware-signer/config.toml
+	chmod 0750 debian/microtun-signer/etc/microtun-signer
+	chmod 0640 debian/microtun-signer/etc/microtun-signer/config.toml
 
 override_dh_installsystemd:
 	# The example configuration is intentionally not runnable as-is. Do not

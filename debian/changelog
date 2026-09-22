@@ -1,36 +1,44 @@
-microtun-firmware-signer (0.4.0) UNRELEASED; urgency=medium
+microtun-signer (0.5.0) UNRELEASED; urgency=medium
 
-  * Split the public signing client into the microtun-firmware-sign binary.
+  * Rename project 
+
+ -- Damian Peckett <damian@pecke.tt>  Tue, 22 Sep 2026 18:32:09 +0200
+
+microtun-signer (0.4.0) unstable; urgency=medium
+
+  * Rename the project, service, package, and binaries to microtun-signer.
+  * Split the public API client into the microtun-signer-client binary.
+  * Add sign and public-key client subcommands.
   * Harden security and access controls
   * Reduce the HTTP API to the essential auth and signing operations
 
- -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 23:15:00 +0200
+ -- Damian Peckett <damian@pecke.tt>  Tue, 22 Sep 2026 18:31:48 +0200
 
-microtun-firmware-signer (0.3.1) unstable; urgency=medium
+microtun-signer (0.3.1) unstable; urgency=medium
 
   * Systemd credentials use ACLs instead of file mod
 
  -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 22:20:17 +0200
 
-microtun-firmware-signer (0.3.0) unstable; urgency=medium
+microtun-signer (0.3.0) unstable; urgency=medium
 
   * No longer pass around fingerprints 
 
  -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 22:19:59 +0200
 
-microtun-firmware-signer (0.2.0) unstable; urgency=medium
+microtun-signer (0.2.0) unstable; urgency=medium
 
   * Simplified API 
 
  -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 21:13:53 +0200
 
-microtun-firmware-signer (0.1.1) unstable; urgency=medium
+microtun-signer (0.1.1) unstable; urgency=medium
 
   * Various packaging fixes 
 
  -- Damian Peckett <damian@pecke.tt>  Sun, 20 Sep 2026 17:32:28 +0200
 
-microtun-firmware-signer (0.1.0) unstable; urgency=medium
+microtun-signer (0.1.0) unstable; urgency=medium
 
   * Initial Debian package.
 

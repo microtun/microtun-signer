@@ -38,10 +38,10 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "microtun-firmware-signer", version)]
+#[command(name = "microtun-signer", version)]
 struct Cli {
     /// Path to the service TOML configuration
-    /// [default: /etc/microtun-firmware-signer/config.toml].
+    /// [default: /etc/microtun-signer/config.toml].
     ///
     /// The unlock subcommand only reads it when given explicitly, so operators
     /// do not need read access to the service configuration.
@@ -75,7 +75,7 @@ struct UnlockArgs {
     admin: AdminSocketArgs,
 }
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/microtun-firmware-signer/config.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/microtun-signer/config.toml";
 
 #[derive(Serialize)]
 struct UnlockRequest<'a> {
@@ -165,7 +165,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     tracing::info!(
         listen = %config.server.listen,
-        "firmware signing service started"
+        "microtun signer service started"
     );
     tracing::info!(
         socket = %config.server.admin_socket_path.display(),
@@ -431,7 +431,7 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("microtun_firmware_signer=info,tower_http=info"));
+        .unwrap_or_else(|_| EnvFilter::new("microtun_signer=info,tower_http=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .json()

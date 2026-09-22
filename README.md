@@ -1,4 +1,4 @@
-# microtun-firmware-signer
+# microtun-signer
 
 A small Rust service that signs MCUboot SHA-256 firmware digests with Ed25519 keys.
 
@@ -34,7 +34,7 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
 ## Run the service
 
 ```bash
-./target/release/microtun-firmware-signer
+./target/release/microtun-signer
 ```
 
 The GitHub OAuth client secret is read from a systemd credential via
@@ -49,7 +49,7 @@ The public listener is plain HTTP. Use a trusted TLS reverse proxy for non-loopb
 Keys start locked after every service restart.
 
 ```bash
-./target/release/microtun-firmware-signer unlock -k microtun-firmware-prod
+./target/release/microtun-signer unlock -k microtun-firmware-prod
 ```
 
 The passphrase is entered interactively and is not accepted through command-line arguments or environment variables.
@@ -59,9 +59,10 @@ The passphrase is entered interactively and is not accepted through command-line
 ### GitHub user
 
 ```bash
-./target/release/microtun-firmware-sign \
-  --github-device \
+./target/release/microtun-signer-client \
   --url https://signer.example.com/ \
+  sign \
+  --github-device \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```
@@ -72,8 +73,9 @@ Enable **Device Flow** in the GitHub OAuth App.
 
 ```bash
 MICROTUN_SIGNER_TOKEN="$TOKEN" \
-  ./target/release/microtun-firmware-sign \
+  ./target/release/microtun-signer-client \
   --url https://signer.example.com/ \
+  sign \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```
@@ -81,6 +83,17 @@ MICROTUN_SIGNER_TOKEN="$TOKEN" \
 `MICROTUN_SIGNER_URL` can be used instead of `--url`.
 
 On success, the client writes only the base64 Ed25519 signature to stdout.
+
+## Get a public key
+
+```bash
+./target/release/microtun-signer-client \
+  --url https://signer.example.com/ \
+  public-key \
+  --key-id microtun-firmware-prod
+```
+
+On success, the client writes the PEM-encoded Ed25519 public key to stdout. The signing key must be unlocked before its public key is available.
 
 ## API
 

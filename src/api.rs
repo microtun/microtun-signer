@@ -241,12 +241,12 @@ pub async fn github_oauth_device_exchange(
         .await
         .map_err(|error| {
             tracing::warn!(
-                target: "microtun_firmware_signer::audit",
+                target: "microtun_signer::audit",
                 request_id = %request_id,
                 operation = "oauth-device-login",
                 success = false,
                 reason = %error,
-                "firmware signer login audit event"
+                "microtun signer login audit event"
             );
             oauth_flow_error(error, &request_id)
         })?;
@@ -326,13 +326,13 @@ pub async fn unlock_key(
     };
     let Some(key) = key else {
         tracing::warn!(
-            target: "microtun_firmware_signer::audit",
+            target: "microtun_signer::audit",
             request_id = %request_id,
             operation = "unlock-key",
             success = false,
             reason = "unknown-key",
             key_id = %key_id,
-            "firmware signer unlock audit event"
+            "microtun signer unlock audit event"
         );
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -388,13 +388,13 @@ pub async fn unlock_key(
         Ok(outcome) => outcome,
         Err(UnlockError::Inactive) => {
             tracing::warn!(
-                target: "microtun_firmware_signer::audit",
+                target: "microtun_signer::audit",
                 request_id = %request_id,
                 operation = "unlock-key",
                 success = false,
                 reason = "key-not-active",
                 key_id = key.id(),
-                "firmware signer unlock audit event"
+                "microtun signer unlock audit event"
             );
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -406,13 +406,13 @@ pub async fn unlock_key(
         }
         Err(UnlockError::InvalidPassphrase) => {
             tracing::warn!(
-                target: "microtun_firmware_signer::audit",
+                target: "microtun_signer::audit",
                 request_id = %request_id,
                 operation = "unlock-key",
                 success = false,
                 reason = "invalid-passphrase",
                 key_id = key.id(),
-                "firmware signer unlock audit event"
+                "microtun signer unlock audit event"
             );
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -434,13 +434,13 @@ pub async fn unlock_key(
     };
 
     tracing::info!(
-        target: "microtun_firmware_signer::audit",
+        target: "microtun_signer::audit",
         request_id = %request_id,
         operation = "unlock-key",
         success = true,
         reason = if outcome == UnlockOutcome::AlreadyUnlocked { "already-unlocked" } else { "ok" },
         key_id = key.id(),
-        "firmware signer unlock audit event"
+        "microtun signer unlock audit event"
     );
 
     Ok(StatusCode::NO_CONTENT)
@@ -448,13 +448,13 @@ pub async fn unlock_key(
 
 fn unlock_task_failed(request_id: &str, key_id: &str) -> ApiError {
     tracing::error!(
-        target: "microtun_firmware_signer::audit",
+        target: "microtun_signer::audit",
         request_id = %request_id,
         operation = "unlock-key",
         success = false,
         reason = "unlock-task-failed",
         key_id = key_id,
-        "firmware signer unlock audit event"
+        "microtun signer unlock audit event"
     );
     ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -913,7 +913,7 @@ fn audit_record(
 
 async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
     tracing::info!(
-        target: "microtun_firmware_signer::audit",
+        target: "microtun_signer::audit",
         request_id = %record.request_id,
         operation = %record.operation,
         success = record.success,
@@ -941,7 +941,7 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
         run_id = record.run_id.as_deref().unwrap_or(""),
         run_attempt = record.run_attempt.as_deref().unwrap_or(""),
         jti = record.jti.as_deref().unwrap_or(""),
-        "firmware signer audit event"
+        "microtun signer audit event"
     );
 }
 

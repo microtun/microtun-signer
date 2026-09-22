@@ -1,0 +1,49 @@
+[Unit]
+Description=Microtun firmware signing service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=microtun-signer
+Group=microtun-signer
+# Needed to hand the admin socket to the operators group (AdminSocketGroup).
+SupplementaryGroups=microtun-signer-operators
+LoadCredentialEncrypted=github-oauth-client-secret:/etc/credstore.encrypted/microtun-github-oauth-client-secret
+RuntimeDirectory=microtun-signer
+# Operators are not in the service group, so they need search (x) permission
+# to reach the socket. The socket itself is 0660 service-user:operators.
+RuntimeDirectoryMode=0751
+ExecStart=/usr/bin/microtun-signer
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+LimitCORE=0
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ReadOnlyPaths=/etc/microtun-signer
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

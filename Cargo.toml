@@ -1,17 +1,17 @@
 [package]
-name = "microtun-firmware-signer"
-version = "0.4.0"
+name = "microtun-signer"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
 
 [[bin]]
-name = "microtun-firmware-signer"
+name = "microtun-signer"
 path = "src/main.rs"
 
 [[bin]]
-name = "microtun-firmware-sign"
-path = "src/bin/microtun-firmware-sign.rs"
+name = "microtun-signer-client"
+path = "src/bin/microtun-signer-client.rs"
 
 [dependencies]
 anyhow = "1.0"
