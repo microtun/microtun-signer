@@ -63,7 +63,7 @@ The passphrase is entered interactively and is not accepted through command-line
 ./target/release/microtun-signer-client \
   --url https://signer.example.com/ \
   sign \
-  --github-device \
+  --github-login \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```

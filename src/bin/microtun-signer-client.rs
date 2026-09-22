@@ -1,5 +1,3 @@
-mod common;
-
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +11,7 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use common::session_cache;
+use microtun_signer::session_cache;
 
 #[derive(Debug, Parser)]
 #[command(name = "microtun-signer-client", version)]
@@ -46,11 +44,11 @@ struct SignArgs {
     #[arg(long, env = "MICROTUN_SIGNER_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// Authenticate with GitHub's OAuth device flow, reusing a cached signer
-    /// session when available. This takes precedence over
-    /// MICROTUN_SIGNER_TOKEN/--token.
-    #[arg(long)]
-    github_device: bool,
+    /// Authenticate as a GitHub user, reusing a cached signer session when
+    /// available. If login is required, GitHub's OAuth device flow is used.
+    /// This takes precedence over MICROTUN_SIGNER_TOKEN/--token.
+    #[arg(long = "github-login", alias = "github-device")]
+    github_login: bool,
 
     /// 32-byte MCUboot SHA-256 digest encoded as base64.
     #[arg(short = 'd', long)]
@@ -124,7 +122,7 @@ async fn sign(url: &str, args: SignArgs) -> Result<()> {
         .context("failed to construct signing API URL")?;
     let client = public_api_client()?;
 
-    let (mut token, reused_cached_session) = if args.github_device {
+    let (mut token, reused_cached_session) = if args.github_login {
         let cached = match session_cache::load(&base_url) {
             Ok(cached) => cached,
             Err(error) => {
@@ -146,14 +144,14 @@ async fn sign(url: &str, args: SignArgs) -> Result<()> {
         (Zeroizing::new(token), false)
     } else {
         bail!(
-            "no bearer credential was provided; set MICROTUN_SIGNER_TOKEN/--token, or pass --github-device for interactive GitHub authentication"
+            "no bearer credential was provided; set MICROTUN_SIGNER_TOKEN/--token, or pass --github-login for GitHub user authentication"
         );
     };
 
     let mut response =
         send_signing_request(&client, &endpoint, token.as_str(), &args.digest).await?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        && args.github_device
+        && args.github_login
         && reused_cached_session
     {
         if let Err(error) = session_cache::remove(&base_url) {
