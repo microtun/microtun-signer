@@ -318,10 +318,7 @@ impl Authenticator {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!(
-                "microtun-signer/",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(concat!("microtun-signer/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             inner: Arc::new(Inner {
