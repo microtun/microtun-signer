@@ -101,10 +101,7 @@ pub async fn sign(url: &str, args: SignArgs) -> Result<()> {
             }
         };
         match cached {
-            Some(token) => {
-                eprintln!("Reusing cached signer session.");
-                (token, true)
-            }
+            Some(token) => (token, true),
             None => (github_device_login(&client, &base_url).await?, false),
         }
     } else if let Some(token) = args.token {
