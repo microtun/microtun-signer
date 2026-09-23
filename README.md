@@ -67,8 +67,6 @@ The passphrase is entered interactively and is not accepted through command-line
   --digest "$DIGEST_BASE64"
 ```
 
-Enable **Device Flow** in the GitHub OAuth App.
-
 ### Existing bearer token / GitHub Actions
 
 ```bash
@@ -78,8 +76,6 @@ MICROTUN_SIGNER_TOKEN="$TOKEN" \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
 ```
-
-`MICROTUN_SIGNER_URL` can be used instead of `--url`.
 
 On success, the command writes only the base64 Ed25519 signature to stdout.
 
