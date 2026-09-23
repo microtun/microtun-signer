@@ -133,11 +133,8 @@ cargo test --all-targets --locked
 
 ## License
 
-This project is proprietary source-available software.
-
-The source is published for transparency, review, and evaluation. It is not
-open-source software.
-
-Commercial or production use requires a separate written license.
-
-See [LICENSE](LICENSE) for details.
+microtun-signer is licensed under the Business Source License 1.1 (`BUSL-1.1`).
+There is no Additional Use Grant, so the BUSL-1.1 non-production-use grant
+applies until the change. Each version changes to the GNU General Public
+License v3.0 or later (`GPL-3.0-or-later`) four years after that version is
+published. See [`LICENSE`](LICENSE) for the complete terms.

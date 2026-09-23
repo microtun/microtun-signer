@@ -1,267 +1,100 @@
-MICROTUN SOURCE AVAILABLE LICENSE 
-Version 1.0
+Business Source License 1.1
 
-Copyright (c) 2026 Damian Peckett
-All rights reserved.
+License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
 
-1. PURPOSE
+-----------------------------------------------------------------------------
 
-The source code and associated materials made available under this license (the
-"Software") are published for transparency, inspection, security research,
-auditing, and evaluation.
+Parameters
 
-The Software is proprietary software.
+Licensor:             Damian Peckett
 
-This License is a proprietary source-available software license. It is not an
-open-source license.
+Licensed Work:        microtun-signer
+                      The Licensed Work is (c) 2026 Damian Peckett
 
-The availability of the source code does not make the Software "open source",
-"free software", or public domain software, and no rights are granted except
-those expressly stated in this License.
+Additional Use Grant: None
 
-2. LIMITED LICENSE FOR INSPECTION AND EVALUATION
+Change Date:          Four years from the date the Licensed Work is published.
 
-Subject to the terms of this License, Damian Peckett grants you a limited,
-non-exclusive, non-transferable, and non-sublicensable right to:
+Change License:       GNU General Public License v3.0 or later
+                      (GPL-3.0-or-later)
 
-(a) view and inspect the source code;
+For information about alternative licensing arrangements for the Licensed
+Work, please contact: owner@microtun.dev
 
-(b) make copies reasonably necessary for personal inspection, auditing, security
-    research, or evaluation; and
+-----------------------------------------------------------------------------
 
-(c) compile or execute the Software solely where reasonably necessary for
-    non-production evaluation, testing, auditing, or security research.
+Notice
 
-This limited license does not permit production, operational, or commercial use
-of the Software.
+The Business Source License (this document, or the "License") is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
 
-Any rights granted by the terms of a source-code hosting platform, including
-rights necessary to view, clone, or fork a repository using that platform's
-functionality, remain subject to the applicable platform terms. Such platform
-rights do not grant any broader right to use, distribute, commercialize, or
-deploy the Software.
+-----------------------------------------------------------------------------
 
-3. COMMERCIAL AND PRODUCTION USE
+Terms
 
-You may not use, deploy, operate, or make the Software available for commercial,
-production, or operational purposes unless you have a separate written license
-or agreement with Damian Peckett expressly permitting such use.
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited
+production use.
 
-A separate commercial license is therefore required for, including but not
-limited to:
+Effective on the Change Date, or the fourth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensor hereby grants you rights under
+the terms of the Change License, and the rights granted in the paragraph
+above terminate.
 
-(a) use of the Software in a production environment;
+If your use of the Licensed Work does not comply with the requirements
+currently in effect as described in this License, you must purchase a
+commercial license from the Licensor, its affiliated entities, or authorized
+resellers, or you must refrain from using the Licensed Work.
 
-(b) use of the Software in connection with a commercial product or service;
+All copies of the original and modified Licensed Work, and derivative works
+of the Licensed Work, are subject to this License. This License applies
+separately for each version of the Licensed Work and the Change Date may vary
+for each version of the Licensed Work released by Licensor.
 
-(c) use of the Software in connection with services provided to third parties;
+You must conspicuously display this License on each original or modified copy
+of the Licensed Work. If you receive the Licensed Work in original or
+modified form from a third party, the terms and conditions set forth in this
+License apply to your use of that work.
 
-(d) use of the Software as part of an internal business or operational system,
-    except for temporary evaluation as permitted by Section 2;
+Any use of the Licensed Work in violation of this License will automatically
+terminate your rights under this License for the current and all other
+versions of the Licensed Work.
 
-(e) hosting or operating the Software as a service; or
+This License does not grant you any right in any trademark or logo of
+Licensor or its affiliates (provided that you may use a trademark or logo of
+Licensor as expressly required by this License).
 
-(f) incorporating the Software or a substantial portion of it into another
-    product, service, appliance, or system intended for production or commercial
-    use.
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON
+AN "AS IS" BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS,
+EXPRESS OR IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND
+TITLE.
 
-4. RESTRICTIONS
+MariaDB hereby grants you permission to use this License's text to license
+your works, and to refer to it using the trademark "Business Source License",
+as long as you comply with the Covenants of Licensor below.
 
-Except as expressly permitted by this License, by mandatory applicable law, or
-by a separate written agreement with Damian Peckett, you may not:
+Covenants of Licensor
 
-(a) use, deploy, or operate the Software for production, commercial, or
-    operational purposes;
+In consideration of the right to use this License's text and the "Business
+Source License" name and trademark, Licensor covenants to MariaDB, and to all
+other recipients of the licensed work to be provided by Licensor:
 
-(b) sell, license, sublicense, rent, lease, or otherwise commercially exploit
-    the Software;
+1. To specify as the Change License the GPL Version 2.0 or any later version,
+   or a license that is compatible with GPL Version 2.0 or a later version,
+   where "compatible" means that software provided under the Change License can
+   be included in a program with software provided under GPL Version 2.0 or a
+   later version. Licensor may specify additional Change Licenses without
+   limitation.
 
-(c) distribute, publish, or provide copies of the Software or derivative works
-    to third parties, except through functionality expressly provided by the
-    source-code hosting platform on which the Software was originally made
-    available and only to the extent permitted by that platform's terms;
+2. To either: (a) specify an additional grant of rights to use that does not
+   impose any additional restriction on the right granted in this License, as
+   the Additional Use Grant; or (b) insert the text "None".
 
-(d) modify, adapt, translate, or create derivative works of the Software except
-    where reasonably necessary for private evaluation, testing, auditing, or
-    security research;
+3. To specify a Change Date.
 
-(e) distribute or commercially use any modification or derivative work;
-
-(f) incorporate the Software or any substantial portion of it into another
-    product, service, or codebase;
-
-(g) provide the Software, or functionality substantially derived from the
-    Software, as a hosted, managed, cloud, or software-as-a-service offering;
-
-(h) use the Software to provide services to third parties; or
-
-(i) remove, alter, or obscure any copyright, license, trademark, attribution, or
-    other proprietary notice contained in the Software.
-
-5. MANDATORY STATUTORY RIGHTS
-
-Nothing in this License is intended to restrict or exclude any right that cannot
-lawfully be restricted or excluded by agreement.
-
-In particular, where German copyright law applies, nothing in this License
-restricts rights arising under Sections 69d and 69e of the German Copyright Act
-(Urheberrechtsgesetz - UrhG) to the extent that contractual restrictions of
-those rights are prohibited by Section 69g UrhG.
-
-Any permission or right arising directly under applicable mandatory law applies
-independently of the permissions granted by this License.
-
-6. SECURITY RESEARCH
-
-Nothing in this License prohibits good-faith security research performed within
-the permissions granted by Section 2 or otherwise permitted by applicable law.
-
-Permission to inspect the Software does not authorize access to systems,
-networks, accounts, credentials, data, devices, or infrastructure that you do
-not own or for which you do not otherwise have authorization.
-
-Security vulnerabilities may be reported to the project using any security
-reporting process identified by the project.
-
-7. OWNERSHIP
-
-The Software is licensed, not sold.
-
-Damian Peckett retains all right, title, and interest in and to the Software,
-including all copyrights and other intellectual-property rights, except for
-rights belonging to third parties.
-
-All rights not expressly granted under this License are reserved.
-
-8. THIRD-PARTY SOFTWARE
-
-The Software may depend on, include, link to, or be distributed alongside
-third-party software.
-
-Third-party software is governed by its respective license terms. Nothing in
-this License limits any rights granted to you directly by a third-party
-licensor.
-
-Where a third-party license grants rights in a particular component, those
-rights continue to apply to that component notwithstanding this License.
-
-9. NO TRADEMARK LICENSE
-
-This License does not grant permission to use the names, trademarks, service
-marks, logos, or branding of Microtun or Damian Peckett except as reasonably
-necessary to identify the Software or describe its origin.
-
-No use may imply endorsement, sponsorship, affiliation, or approval without
-prior written permission.
-
-10. NO PATENT LICENSE
-
-Except to the extent required by applicable law, no patent rights are granted
-under this License.
-
-Any patent license applicable to commercial or production use must be granted
-separately in writing.
-
-11. SEPARATE AGREEMENTS
-
-If you have entered into a separate written agreement with Damian Peckett that
-governs your use of the Software, that agreement takes precedence over this
-License to the extent of any conflict.
-
-Rights granted under a separate commercial license apply only according to the
-terms of that agreement.
-
-12. TERMINATION
-
-The rights granted under this License terminate if you materially breach this
-License and fail to remedy the breach where the breach is capable of remedy.
-
-No opportunity to remedy is required where the breach is intentional, cannot
-reasonably be remedied, or where applicable law permits immediate termination.
-
-Upon termination, you must cease exercising rights granted solely under this
-License.
-
-Termination does not affect rights arising independently under mandatory law,
-third-party licenses, or a separate written agreement.
-
-13. NO GUARANTEE
-
-The Software is made available without charge for transparency, inspection,
-security research, auditing, and evaluation.
-
-Unless expressly agreed otherwise in writing, Damian Peckett does not assume any
-guarantee (Garantie), including any guarantee as to particular characteristics,
-availability, security, fitness for a particular purpose, or absence of defects.
-
-Statutory rights and liabilities that cannot lawfully be excluded or limited
-remain unaffected.
-
-14. LIABILITY
-
-Damian Peckett shall be liable without limitation:
-
-(a) for damage caused intentionally or by gross negligence;
-
-(b) for injury to life, body, or health caused intentionally or negligently;
-
-(c) where liability arises from an expressly assumed guarantee;
-
-(d) in cases of fraudulent concealment; and
-
-(e) where liability is mandatory under applicable law, including the German
-    Product Liability Act (Produkthaftungsgesetz).
-
-In cases of ordinary negligence, Damian Peckett shall be liable only for breach
-of an essential contractual obligation, meaning an obligation whose performance
-is necessary for the proper performance of this License and on whose performance
-the licensee may ordinarily rely. In such cases, liability shall be limited to
-damage that was foreseeable and typical for this type of agreement at the time
-the License became applicable.
-
-Subject to the foregoing provisions, liability for ordinary negligence is
-excluded.
-
-These limitations also apply for the benefit of Damian Peckett's
-representatives, agents, employees, and other persons for whom Damian Peckett is
-legally responsible.
-
-15. NO IMPLIED RIGHTS
-
-No rights are granted by implication, estoppel, or otherwise.
-
-Possession of, access to, or publication of the source code does not grant any
-rights beyond those expressly stated in this License.
-
-16. RESERVATION OF RIGHTS
-
-All rights not expressly granted by this License are reserved by Damian Peckett.
-
-17. GOVERNING LAW
-
-This License and any dispute arising out of or in connection with it shall be
-governed by the laws of the Federal Republic of Germany, excluding its
-conflict-of-laws rules and the United Nations Convention on Contracts for the
-International Sale of Goods (CISG).
-
-Where the licensee is a consumer, this choice of law does not deprive the
-licensee of any protection afforded by mandatory provisions of the law that
-would apply in the absence of this choice of law.
-
-18. JURISDICTION
-
-To the extent permitted by applicable law, if the licensee is a merchant
-(Kaufmann), a legal entity under public law, or a special fund under public law,
-the courts having jurisdiction at Damian Peckett's place of business shall have
-exclusive jurisdiction over disputes arising out of or in connection with this
-License.
-
-Otherwise, jurisdiction shall be determined in accordance with applicable law.
-
-19. SEVERABILITY
-
-If any provision of this License is wholly or partly invalid or unenforceable,
-the remaining provisions shall remain unaffected to the extent permitted by
-applicable law.
-
-Any resulting gap shall be governed by applicable statutory law.
+4. Not to modify this License in any other way.
