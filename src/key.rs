@@ -2,13 +2,17 @@ use std::{collections::HashMap, fs, path::Path, sync::RwLock};
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{
-    Signature, Signer, SigningKey,
+    Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     pkcs8::{DecodePrivateKey, EncodePublicKey},
+};
+use k256::ecdsa::{
+    Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey,
+    signature::hazmat::PrehashSigner,
 };
 use pkcs8::LineEnding;
 use zeroize::Zeroizing;
 
-use crate::config::{KeyConfig, KeyState};
+use crate::config::{KeyAlgorithm, KeyConfig, KeyState};
 
 pub struct KeyRing {
     keys: HashMap<String, KeyMaterial>,
@@ -52,13 +56,15 @@ impl KeyRing {
 
 pub struct KeyMaterial {
     id: String,
+    algorithm: KeyAlgorithm,
     state: KeyState,
     encrypted_pem: Zeroizing<String>,
     unlocked: RwLock<Option<UnlockedKeyMaterial>>,
 }
 
-struct UnlockedKeyMaterial {
-    signing_key: SigningKey,
+enum UnlockedKeyMaterial {
+    Ed25519(Ed25519SigningKey),
+    Secp256k1(Secp256k1SigningKey),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +77,9 @@ pub enum UnlockOutcome {
 pub enum UnlockError {
     #[error("signing key is not active")]
     Inactive,
-    #[error("signing key passphrase is invalid or the encrypted key cannot be decrypted")]
+    #[error(
+        "signing key passphrase is invalid, the key cannot be decrypted, or its type does not match the configured algorithm"
+    )]
     InvalidPassphrase,
     #[error("signing key lock is poisoned")]
     LockPoisoned,
@@ -99,17 +107,23 @@ impl KeyMaterial {
 
         Ok(Self {
             id: config.id.clone(),
+            algorithm: config.algorithm,
             state: config.state,
             encrypted_pem: pem,
             unlocked: RwLock::new(None),
         })
     }
 
-    /// Build an active, locked key from PEM text without file checks.
+    /// Build an active, locked key of the requested algorithm from PEM text.
     #[cfg(test)]
-    pub(crate) fn from_pem_for_tests(id: &str, pem: &str) -> Self {
+    pub(crate) fn from_pem_with_algorithm_for_tests(
+        id: &str,
+        algorithm: KeyAlgorithm,
+        pem: &str,
+    ) -> Self {
         Self {
             id: id.to_owned(),
+            algorithm,
             state: KeyState::Active,
             encrypted_pem: Zeroizing::new(pem.to_owned()),
             unlocked: RwLock::new(None),
@@ -118,6 +132,10 @@ impl KeyMaterial {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub const fn algorithm(&self) -> KeyAlgorithm {
+        self.algorithm
     }
 
     pub const fn state(&self) -> KeyState {
@@ -134,11 +152,16 @@ impl KeyMaterial {
     pub fn public_key_pem(&self) -> Option<String> {
         let guard = self.unlocked.read().ok()?;
         let key = guard.as_ref()?;
-        let mut pem = key
-            .signing_key
-            .verifying_key()
-            .to_public_key_pem(LineEnding::LF)
-            .ok()?;
+        let mut pem = match key {
+            UnlockedKeyMaterial::Ed25519(signing_key) => signing_key
+                .verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .ok()?,
+            UnlockedKeyMaterial::Secp256k1(signing_key) => signing_key
+                .verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .ok()?,
+        };
         if !pem.ends_with('\n') {
             pem.push('\n');
         }
@@ -160,12 +183,20 @@ impl KeyMaterial {
             }
         }
 
-        let signing_key = SigningKey::from_pkcs8_encrypted_pem(
-            self.encrypted_pem.as_str(),
-            passphrase.as_bytes(),
-        )
-        .map_err(|_| UnlockError::InvalidPassphrase)?;
-        let unlocked = UnlockedKeyMaterial { signing_key };
+        let unlocked = match self.algorithm {
+            KeyAlgorithm::Ed25519 => Ed25519SigningKey::from_pkcs8_encrypted_pem(
+                self.encrypted_pem.as_str(),
+                passphrase.as_bytes(),
+            )
+            .map(UnlockedKeyMaterial::Ed25519)
+            .map_err(|_| UnlockError::InvalidPassphrase)?,
+            KeyAlgorithm::Secp256k1 => Secp256k1SigningKey::from_pkcs8_encrypted_pem(
+                self.encrypted_pem.as_str(),
+                passphrase.as_bytes(),
+            )
+            .map(UnlockedKeyMaterial::Secp256k1)
+            .map_err(|_| UnlockError::InvalidPassphrase)?,
+        };
 
         let mut guard = self
             .unlocked
@@ -181,8 +212,19 @@ impl KeyMaterial {
     pub fn sign_digest(&self, digest: &[u8; 32]) -> Option<[u8; 64]> {
         let guard = self.unlocked.read().ok()?;
         let key = guard.as_ref()?;
-        let signature: Signature = key.signing_key.sign(digest);
-        Some(signature.to_bytes())
+        match key {
+            UnlockedKeyMaterial::Ed25519(signing_key) => {
+                let signature: Ed25519Signature = signing_key.sign(digest);
+                Some(signature.to_bytes())
+            }
+            UnlockedKeyMaterial::Secp256k1(signing_key) => {
+                let signature: Secp256k1Signature = signing_key.sign_prehash(digest).ok()?;
+                let bytes = signature.to_bytes();
+                let mut output = [0u8; 64];
+                output.copy_from_slice(&bytes);
+                Some(output)
+            }
+        }
     }
 }
 
@@ -387,13 +429,15 @@ fn load_credential_from(directory: &Path, name: &str, label: &str) -> Result<Zer
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Verifier, VerifyingKey};
+    use ed25519_dalek::{Verifier, VerifyingKey as Ed25519VerifyingKey};
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
 
     use super::*;
 
     fn test_key(id: &str, state: KeyState) -> KeyMaterial {
         KeyMaterial {
             id: id.into(),
+            algorithm: KeyAlgorithm::Ed25519,
             state,
             encrypted_pem: Zeroizing::new(
                 include_str!("../tests/fixtures/test-ed25519-encrypted.pem").to_owned(),
@@ -403,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_test_key_starts_locked_then_unlocks_and_signs_exact_digest() {
+    fn encrypted_ed25519_key_starts_locked_then_unlocks_and_signs_exact_digest() {
         let key = test_key("test-key", KeyState::Active);
         assert!(!key.is_unlocked());
         assert!(key.public_key_pem().is_none());
@@ -420,19 +464,64 @@ mod tests {
         );
 
         let digest = [0x5a; 32];
-        let signature = Signature::from_bytes(&key.sign_digest(&digest).unwrap());
-        let signing_key = SigningKey::from_pkcs8_encrypted_pem(
+        let signature = Ed25519Signature::from_bytes(&key.sign_digest(&digest).unwrap());
+        let signing_key = Ed25519SigningKey::from_pkcs8_encrypted_pem(
             include_str!("../tests/fixtures/test-ed25519-encrypted.pem"),
             b"test-passphrase",
         )
         .unwrap();
-        let verifying_key = VerifyingKey::from(&signing_key);
+        let verifying_key = Ed25519VerifyingKey::from(&signing_key);
         verifying_key.verify(&digest, &signature).unwrap();
         assert!(
             key.public_key_pem()
                 .unwrap()
                 .starts_with("-----BEGIN PUBLIC KEY-----\n")
         );
+    }
+
+    #[test]
+    fn encrypted_secp256k1_key_unlocks_and_signs_the_digest_as_a_prehash() {
+        let key = KeyMaterial::from_pem_with_algorithm_for_tests(
+            "secp-key",
+            KeyAlgorithm::Secp256k1,
+            include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"),
+        );
+        assert_eq!(key.algorithm(), KeyAlgorithm::Secp256k1);
+        assert_eq!(
+            key.unlock("test-passphrase").unwrap(),
+            UnlockOutcome::Unlocked
+        );
+
+        let digest = [0x42; 32];
+        let signature_bytes = key.sign_digest(&digest).unwrap();
+        let signature = Secp256k1Signature::from_slice(&signature_bytes).unwrap();
+        let signing_key = Secp256k1SigningKey::from_pkcs8_encrypted_pem(
+            include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"),
+            b"test-passphrase",
+        )
+        .unwrap();
+        signing_key
+            .verifying_key()
+            .verify_prehash(&digest, &signature)
+            .unwrap();
+        assert!(
+            key.public_key_pem()
+                .unwrap()
+                .starts_with("-----BEGIN PUBLIC KEY-----\n")
+        );
+    }
+
+    #[test]
+    fn configured_key_algorithm_must_match_private_key_type() {
+        let key = KeyMaterial::from_pem_with_algorithm_for_tests(
+            "wrong-algorithm",
+            KeyAlgorithm::Ed25519,
+            include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"),
+        );
+        assert!(matches!(
+            key.unlock("test-passphrase"),
+            Err(UnlockError::InvalidPassphrase)
+        ));
     }
 
     #[test]
@@ -471,6 +560,7 @@ mod tests {
         for strong in [
             include_str!("../tests/fixtures/test-ed25519-scrypt.pem"),
             include_str!("../tests/fixtures/test-ed25519-pbkdf2-600k.pem"),
+            include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"),
         ] {
             enforce_key_encryption_policy(strong).unwrap();
         }
@@ -478,7 +568,7 @@ mod tests {
 
     #[test]
     fn documented_scrypt_parameters_unlock_in_rust() {
-        SigningKey::from_pkcs8_encrypted_pem(
+        Ed25519SigningKey::from_pkcs8_encrypted_pem(
             include_str!("../tests/fixtures/test-ed25519-scrypt.pem"),
             b"test-passphrase",
         )
@@ -566,6 +656,7 @@ mod tests {
         }
         let config = |path: &std::path::Path| KeyConfig {
             id: "k".into(),
+            algorithm: KeyAlgorithm::Ed25519,
             pem_path: path.to_path_buf(),
             state: KeyState::Active,
             passphrase_credential: None,

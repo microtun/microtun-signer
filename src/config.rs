@@ -72,6 +72,8 @@ pub struct ServerConfig {
 pub struct KeyConfig {
     #[serde(rename = "ID")]
     pub id: String,
+    #[serde(rename = "Algorithm")]
+    pub algorithm: KeyAlgorithm,
     #[serde(rename = "PEMPath")]
     pub pem_path: PathBuf,
     #[serde(rename = "State", default)]
@@ -80,6 +82,22 @@ pub struct KeyConfig {
     // are no longer loaded from environment/files/systemd credentials.
     #[serde(rename = "PassphraseCredential", default)]
     pub passphrase_credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyAlgorithm {
+    Ed25519,
+    Secp256k1,
+}
+
+impl KeyAlgorithm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::Secp256k1 => "secp256k1",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -658,6 +676,7 @@ Listen = "127.0.0.1:8080"
 
 [[Key]]
 ID = "test-key"
+Algorithm = "ed25519"
 PEMPath = "/tmp/test-key.pem"
 
 [GitHub]
@@ -676,6 +695,31 @@ OAuthClientID = "Iv1.test-client-id"
         assert!(!valid_key_id(""));
         assert!(!valid_key_id("bad/key"));
         assert!(!valid_key_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn signing_key_algorithm_is_required_and_accepts_supported_values() {
+        let text = base_config(
+            r#"[[Identity]]
+ID = "maintainer"
+Type = "github-account"
+GitHubUserID = "42"
+
+[[Policy]]
+Identity = "maintainer"
+Actions = ["sign"]
+Keys = ["test-key"]
+"#,
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.keys[0].algorithm, KeyAlgorithm::Ed25519);
+
+        let secp = text.replace("Algorithm = \"ed25519\"", "Algorithm = \"secp256k1\"");
+        let config: Config = toml::from_str(&secp).unwrap();
+        assert_eq!(config.keys[0].algorithm, KeyAlgorithm::Secp256k1);
+
+        let missing = text.replace("Algorithm = \"ed25519\"\n", "");
+        assert!(toml::from_str::<Config>(&missing).is_err());
     }
 
     #[test]

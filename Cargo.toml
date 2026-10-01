@@ -1,6 +1,6 @@
 [package]
 name = "microtun-signer"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
@@ -21,6 +21,7 @@ ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem", "zeroize"] }
 getrandom = "0.3"
 hex = "0.4"
 jsonwebtoken = "9.3.1"
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "pem", "std"] }
 libc = "0.2"
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest"] }
 pkcs8 = { version = "0.10.2", features = ["encryption", "pem"] }

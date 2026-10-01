@@ -1,6 +1,6 @@
 # microtun-signer
 
-A small Rust service that signs MCUboot SHA-256 firmware digests with Ed25519 keys.
+A small Rust service that signs MCUboot SHA-256 firmware digests.
 
 It supports:
 
@@ -21,9 +21,10 @@ Edit `config.toml` with your server, GitHub, access-policy, and signing-key sett
 
 ## Signing key
 
-The private key must be encrypted PKCS#8.
+The private key must be encrypted PKCS#8. Every `[[Key]]` must explicitly set
+`Algorithm = "ed25519"` or `Algorithm = "secp256k1"`.
 
-Example:
+Ed25519 example:
 
 ```bash
 openssl genpkey -algorithm ED25519 | openssl pkcs8 -topk8 \
@@ -31,6 +32,21 @@ openssl genpkey -algorithm ED25519 | openssl pkcs8 -topk8 \
   -scrypt -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
   -out firmware-signing-key.encrypted.pem
 ```
+
+secp256k1 example:
+
+```bash
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp256k1 | \
+  openssl pkcs8 -topk8 \
+    -v2 aes-256-cbc \
+    -scrypt -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
+    -out firmware-signing-key.encrypted.pem
+```
+
+> **MCUboot compatibility:** upstream MCUboot/imgtool supports `ecdsa-p256`
+> (secp256r1), not secp256k1. Use secp256k1 only when your firmware verifier
+> or MCUboot integration explicitly supports the secp256k1 curve and the compact
+> 64-byte signature encoding documented below.
 
 ## Run the service
 
@@ -77,7 +93,10 @@ MICROTUN_SIGNER_TOKEN="$TOKEN" \
   --digest "$DIGEST_BASE64"
 ```
 
-On success, the command writes only the base64 Ed25519 signature to stdout.
+On success, the command writes only the base64 signature to stdout. Ed25519
+signatures are 64 bytes. secp256k1 signatures are ECDSA over the supplied digest
+and use the fixed-width 64-byte `r || s` encoding (32-byte big-endian `r`, then
+32-byte big-endian `s`).
 
 ## Get a public key
 
@@ -87,7 +106,7 @@ On success, the command writes only the base64 Ed25519 signature to stdout.
   --key-id microtun-firmware-prod
 ```
 
-On success, the command writes the PEM-encoded Ed25519 public key to stdout. The signing key must be unlocked before its public key is available.
+On success, the command writes the PEM-encoded SubjectPublicKeyInfo public key to stdout. The signing key must be unlocked before its public key is available.
 
 ## API
 
@@ -111,7 +130,7 @@ Successful responses use:
 
 ```json
 {
-  "signature": "<base64-ed25519-signature>"
+  "signature": "<base64-signature>"
 }
 ```
 

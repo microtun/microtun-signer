@@ -1,3 +1,9 @@
+microtun-signer (0.7.0) UNRELEASED; urgency=medium
+
+  * Add secp256k1 support (for raspberry pi pico)
+
+ -- Damian Peckett <damian@pecke.tt>  Thu, 01 Oct 2026 17:27:47 +0200
+
 microtun-signer (0.6.0) unstable; urgency=medium
 
   * Consolidate all the commands 

@@ -134,6 +134,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     for key in keys.iter() {
         tracing::info!(
             key_id = key.id(),
+            key_algorithm = key.algorithm().as_str(),
             key_state = key.state().as_str(),
             lock_state = "locked",
             "registered encrypted firmware signing key"
