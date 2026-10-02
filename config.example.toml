@@ -28,7 +28,7 @@ AdminSocketGroup = "microtun-signer-operators"
 # referenced by the signing URL and authorization policies below.
 [[Key]]
 ID = "microtun-firmware-prod"
-# Required. Supported values: "ed25519" and "secp256k1".
+# Required. Supported values: "ed25519", "secp256k1", and "rsa-pss".
 Algorithm = "ed25519"
 PEMPath = "/etc/microtun-signer/firmware-signing-key.encrypted.pem"
 State = "active"

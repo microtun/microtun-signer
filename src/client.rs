@@ -139,8 +139,8 @@ pub async fn sign(url: &str, args: SignArgs) -> Result<()> {
     let signature = BASE64
         .decode(signed.signature.as_bytes())
         .context("signing API returned a non-base64 signature")?;
-    if signature.len() != 64 {
-        bail!("signing API returned a signature with an invalid length");
+    if signature.is_empty() {
+        bail!("signing API returned an empty signature");
     }
 
     println!("{}", signed.signature);

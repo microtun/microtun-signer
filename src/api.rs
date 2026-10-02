@@ -24,7 +24,7 @@ use crate::{
     auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError},
     authorization::Authorizer,
     config::{KeyState, PolicyAction, valid_key_id},
-    key::{KeyRing, UnlockError, UnlockOutcome},
+    key::{KeyRing, SignError, UnlockError, UnlockOutcome},
 };
 use zeroize::Zeroizing;
 
@@ -570,15 +570,27 @@ pub async fn create_signature(
         .get(&key_id)
         .expect("validated key must remain present in immutable keyring");
     let firmware_digest = hex::encode(digest);
-    let signature = key.sign_digest(&digest).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::LOCKED,
-            "key-locked",
-            "Signing key is locked",
-            "The requested signing key must be manually unlocked before it can create signatures.",
-            &attempt_request_id,
-        )
-    })?;
+    let signature = match key.sign_digest(&digest) {
+        Ok(signature) => signature,
+        Err(SignError::Locked) => {
+            return Err(ApiError::new(
+                StatusCode::LOCKED,
+                "key-locked",
+                "Signing key is locked",
+                "The requested signing key must be manually unlocked before it can create signatures.",
+                &attempt_request_id,
+            ));
+        }
+        Err(SignError::Failed) => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "signing-failed",
+                "Signing operation failed",
+                "The signing key could not create a signature due to an internal error.",
+                &attempt_request_id,
+            ));
+        }
+    };
 
     audit_best_effort(
         &state,

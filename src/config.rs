@@ -89,6 +89,8 @@ pub struct KeyConfig {
 pub enum KeyAlgorithm {
     Ed25519,
     Secp256k1,
+    #[serde(rename = "rsa-pss")]
+    RsaPss,
 }
 
 impl KeyAlgorithm {
@@ -96,6 +98,7 @@ impl KeyAlgorithm {
         match self {
             Self::Ed25519 => "ed25519",
             Self::Secp256k1 => "secp256k1",
+            Self::RsaPss => "rsa-pss",
         }
     }
 }
@@ -717,6 +720,10 @@ Keys = ["test-key"]
         let secp = text.replace("Algorithm = \"ed25519\"", "Algorithm = \"secp256k1\"");
         let config: Config = toml::from_str(&secp).unwrap();
         assert_eq!(config.keys[0].algorithm, KeyAlgorithm::Secp256k1);
+
+        let rsa_pss = text.replace("Algorithm = \"ed25519\"", "Algorithm = \"rsa-pss\"");
+        let config: Config = toml::from_str(&rsa_pss).unwrap();
+        assert_eq!(config.keys[0].algorithm, KeyAlgorithm::RsaPss);
 
         let missing = text.replace("Algorithm = \"ed25519\"\n", "");
         assert!(toml::from_str::<Config>(&missing).is_err());

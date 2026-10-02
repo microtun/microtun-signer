@@ -1,15 +1,19 @@
 use std::{collections::HashMap, fs, path::Path, sync::RwLock};
 
 use anyhow::{Context, Result, bail};
-use ed25519_dalek::{
-    Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
-    pkcs8::{DecodePrivateKey, EncodePublicKey},
-};
+use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey};
 use k256::ecdsa::{
     Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey,
     signature::hazmat::PrehashSigner,
 };
-use pkcs8::LineEnding;
+use pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+use rand::rngs::OsRng;
+use rsa::{
+    RsaPrivateKey, RsaPublicKey,
+    pss::{Signature as RsaPssSignature, SigningKey as RsaPssSigningKey},
+    signature::{SignatureEncoding as _, hazmat::RandomizedPrehashSigner as _},
+};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::config::{KeyAlgorithm, KeyConfig, KeyState};
@@ -65,12 +69,21 @@ pub struct KeyMaterial {
 enum UnlockedKeyMaterial {
     Ed25519(Ed25519SigningKey),
     Secp256k1(Secp256k1SigningKey),
+    RsaPss(RsaPssSigningKey<Sha256>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockOutcome {
     Unlocked,
     AlreadyUnlocked,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SignError {
+    #[error("signing key is locked")]
+    Locked,
+    #[error("signing operation failed")]
+    Failed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +174,9 @@ impl KeyMaterial {
                 .verifying_key()
                 .to_public_key_pem(LineEnding::LF)
                 .ok()?,
+            UnlockedKeyMaterial::RsaPss(signing_key) => RsaPublicKey::from(signing_key.as_ref())
+                .to_public_key_pem(LineEnding::LF)
+                .ok()?,
         };
         if !pem.ends_with('\n') {
             pem.push('\n');
@@ -196,6 +212,13 @@ impl KeyMaterial {
             )
             .map(UnlockedKeyMaterial::Secp256k1)
             .map_err(|_| UnlockError::InvalidPassphrase)?,
+            KeyAlgorithm::RsaPss => RsaPrivateKey::from_pkcs8_encrypted_pem(
+                self.encrypted_pem.as_str(),
+                passphrase.as_bytes(),
+            )
+            .map(RsaPssSigningKey::<Sha256>::new)
+            .map(UnlockedKeyMaterial::RsaPss)
+            .map_err(|_| UnlockError::InvalidPassphrase)?,
         };
 
         let mut guard = self
@@ -209,20 +232,25 @@ impl KeyMaterial {
         Ok(UnlockOutcome::Unlocked)
     }
 
-    pub fn sign_digest(&self, digest: &[u8; 32]) -> Option<[u8; 64]> {
-        let guard = self.unlocked.read().ok()?;
-        let key = guard.as_ref()?;
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>, SignError> {
+        let guard = self.unlocked.read().map_err(|_| SignError::Failed)?;
+        let key = guard.as_ref().ok_or(SignError::Locked)?;
         match key {
             UnlockedKeyMaterial::Ed25519(signing_key) => {
                 let signature: Ed25519Signature = signing_key.sign(digest);
-                Some(signature.to_bytes())
+                Ok(signature.to_bytes().to_vec())
             }
             UnlockedKeyMaterial::Secp256k1(signing_key) => {
-                let signature: Secp256k1Signature = signing_key.sign_prehash(digest).ok()?;
-                let bytes = signature.to_bytes();
-                let mut output = [0u8; 64];
-                output.copy_from_slice(&bytes);
-                Some(output)
+                let signature: Secp256k1Signature = signing_key
+                    .sign_prehash(digest)
+                    .map_err(|_| SignError::Failed)?;
+                Ok(signature.to_bytes().to_vec())
+            }
+            UnlockedKeyMaterial::RsaPss(signing_key) => {
+                let signature: RsaPssSignature = signing_key
+                    .sign_prehash_with_rng(&mut OsRng, digest)
+                    .map_err(|_| SignError::Failed)?;
+                Ok(signature.to_vec())
             }
         }
     }
@@ -431,6 +459,7 @@ fn load_credential_from(directory: &Path, name: &str, label: &str) -> Result<Zer
 mod tests {
     use ed25519_dalek::{Verifier, VerifyingKey as Ed25519VerifyingKey};
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
+    use rsa::pss::VerifyingKey as RsaPssVerifyingKey;
 
     use super::*;
 
@@ -451,7 +480,10 @@ mod tests {
         let key = test_key("test-key", KeyState::Active);
         assert!(!key.is_unlocked());
         assert!(key.public_key_pem().is_none());
-        assert!(key.sign_digest(&[0x5a; 32]).is_none());
+        assert!(matches!(
+            key.sign_digest(&[0x5a; 32]),
+            Err(SignError::Locked)
+        ));
 
         assert_eq!(
             key.unlock("test-passphrase").unwrap(),
@@ -464,7 +496,8 @@ mod tests {
         );
 
         let digest = [0x5a; 32];
-        let signature = Ed25519Signature::from_bytes(&key.sign_digest(&digest).unwrap());
+        let signature_bytes = key.sign_digest(&digest).unwrap();
+        let signature = Ed25519Signature::from_slice(&signature_bytes).unwrap();
         let signing_key = Ed25519SigningKey::from_pkcs8_encrypted_pem(
             include_str!("../tests/fixtures/test-ed25519-encrypted.pem"),
             b"test-passphrase",
@@ -504,6 +537,37 @@ mod tests {
             .verifying_key()
             .verify_prehash(&digest, &signature)
             .unwrap();
+        assert!(
+            key.public_key_pem()
+                .unwrap()
+                .starts_with("-----BEGIN PUBLIC KEY-----\n")
+        );
+    }
+
+    #[test]
+    fn encrypted_rsa_pss_key_unlocks_and_signs_the_digest_as_a_sha256_prehash() {
+        let key = KeyMaterial::from_pem_with_algorithm_for_tests(
+            "rsa-key",
+            KeyAlgorithm::RsaPss,
+            include_str!("../tests/fixtures/test-rsa-pss-scrypt.pem"),
+        );
+        assert_eq!(key.algorithm(), KeyAlgorithm::RsaPss);
+        assert_eq!(
+            key.unlock("test-passphrase").unwrap(),
+            UnlockOutcome::Unlocked
+        );
+
+        let digest = [0x24; 32];
+        let signature_bytes = key.sign_digest(&digest).unwrap();
+        assert_eq!(signature_bytes.len(), 256);
+        let signature = RsaPssSignature::try_from(signature_bytes.as_slice()).unwrap();
+        let private_key = RsaPrivateKey::from_pkcs8_encrypted_pem(
+            include_str!("../tests/fixtures/test-rsa-pss-scrypt.pem"),
+            b"test-passphrase",
+        )
+        .unwrap();
+        let verifying_key = RsaPssVerifyingKey::<Sha256>::new(RsaPublicKey::from(private_key));
+        verifying_key.verify_prehash(&digest, &signature).unwrap();
         assert!(
             key.public_key_pem()
                 .unwrap()

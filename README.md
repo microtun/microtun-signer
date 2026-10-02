@@ -1,6 +1,6 @@
 # microtun-signer
 
-A small Rust service that signs MCUboot SHA-256 firmware digests.
+A small Rust service that signs MCUboot firmware digests.
 
 It supports:
 
@@ -12,6 +12,7 @@ It supports:
 
 - Ed25519 (recommended)
 - secp256k1 (RPI Pico 2)
+- RSA-PSS with SHA-256 (MCUboot RSA-2048/RSA-3072)
 
 ## Build
 
@@ -27,7 +28,7 @@ Edit `config.toml` with your server, GitHub, access-policy, and signing-key sett
 ## Signing key
 
 The private key must be encrypted PKCS#8. Every `[[Key]]` must explicitly set
-`Algorithm = "ed25519"` or `Algorithm = "secp256k1"`.
+`Algorithm = "ed25519"`, `Algorithm = "secp256k1"`, or `Algorithm = "rsa-pss"`.
 
 Ed25519 example:
 
@@ -42,6 +43,16 @@ secp256k1 example:
 
 ```bash
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp256k1 | \
+  openssl pkcs8 -topk8 \
+    -v2 aes-256-cbc \
+    -scrypt -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
+    -out firmware-signing-key.encrypted.pem
+```
+
+RSA-PSS example:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 | \
   openssl pkcs8 -topk8 \
     -v2 aes-256-cbc \
     -scrypt -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
@@ -96,7 +107,8 @@ MICROTUN_SIGNER_TOKEN="$TOKEN" \
 On success, the command writes only the base64 signature to stdout. Ed25519
 signatures are 64 bytes. secp256k1 signatures are ECDSA over the supplied digest
 and use the fixed-width 64-byte `r || s` encoding (32-byte big-endian `r`, then
-32-byte big-endian `s`).
+32-byte big-endian `s`). RSA-PSS signatures are 256 bytes for RSA-2048 and 384
+bytes for RSA-3072.
 
 ## Get a public key
 
