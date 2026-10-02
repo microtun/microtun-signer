@@ -163,6 +163,17 @@ pub async fn health() -> StatusCode {
 }
 
 #[derive(Serialize)]
+pub struct VersionResponse {
+    version: &'static str,
+}
+
+pub async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+#[derive(Serialize)]
 struct OAuthSessionResponse {
     access_token: String,
     expires_in: u64,
@@ -1034,6 +1045,12 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::auth::{AuthSource, GithubAccountIdentity, GithubActionsIdentity};
+
+    #[tokio::test]
+    async fn version_reports_package_version() {
+        let Json(response) = version().await;
+        assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn oauth_device_exchange_accepts_only_access_token() {

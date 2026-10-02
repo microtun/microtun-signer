@@ -124,10 +124,19 @@ On success, the command writes the PEM-encoded SubjectPublicKeyInfo public key t
 
 ```text
 GET  /healthz
+GET  /version
 GET  /v1/auth/github/device
 POST /v1/auth/github/device
 GET  /v1/public-key/{key_id}
 POST /v1/sign/{key_id}
+```
+
+The version endpoint returns the running package version:
+
+```json
+{
+  "version": "0.8.0"
+}
 ```
 
 Signing requests use:

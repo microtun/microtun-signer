@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use crate::{
     api::{
         AdminState, AppState, create_signature, get_public_key, github_oauth_device_config,
-        github_oauth_device_exchange, health, unlock_key,
+        github_oauth_device_exchange, health, unlock_key, version,
     },
     auth::Authenticator,
     authorization::Authorizer,
@@ -157,6 +157,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/version", get(version))
         .route(
             "/v1/auth/github/device",
             get(github_oauth_device_config).post(github_oauth_device_exchange),
