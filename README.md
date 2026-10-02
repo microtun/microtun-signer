@@ -10,9 +10,9 @@ It supports:
 
 ## Supported algorithms
 
-- Ed25519 (recommended)
+- Ed25519
 - secp256k1 (RPI Pico 2)
-- RSA-PSS with SHA-256 (MCUboot RSA-2048/RSA-3072)
+- RSA-PSS (Espressif ESP32)
 
 ## Build
 
