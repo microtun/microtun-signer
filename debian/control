@@ -1,0 +1,21 @@
+Source: microtun-signer
+Section: admin
+Priority: optional
+Maintainer: Local Package Builder <root@localhost>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: microtun-signer
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ adduser,
+ systemd
+Description: Microtun firmware signing service
+ A small Rust service for signing MCUboot SHA-256 firmware digests with 
+ encrypted Ed25519 keys.

@@ -1,0 +1,215 @@
+MICROTUN SOURCE AVAILABLE LICENSE  
+Version 1.0
+
+Copyright (c) 2026 Damian Peckett  
+All rights reserved.
+
+## 1. PURPOSE
+
+The source code and associated materials made available under this license (the "Software") are published for transparency, inspection, security research, auditing, and evaluation.
+
+The Software is proprietary software made available under a source-available license. It is not an open-source license, and no rights are granted except those expressly stated in this License.
+
+## 2. DEFINITIONS
+
+For purposes of this License:
+
+**"Licensor"** means the copyright holder identified in the copyright notice above.
+
+**"You" or "Licensee"** means the individual or legal entity exercising rights under this License.
+
+If an individual exercises rights under this License on behalf of a legal entity, organization, employer, or other principal, that entity or principal is the Licensee, provided that the individual is authorized to act on its behalf.
+
+A Licensee that is a legal entity may permit its employees, officers, contractors, and other personnel under its direction or control ("Authorized Personnel") to exercise the rights granted by this License solely on the Licensee's behalf and solely for purposes permitted by this License. Such exercise does not constitute a transfer or sublicense. The Licensee is responsible for compliance with this License by its Authorized Personnel.
+
+**"Evaluation Period"** means the period beginning when the Licensee first compiles, executes, or otherwise runs the Software for a particular Evaluation and ending sixty (60) calendar days thereafter, unless the Licensor agrees in writing to a longer period.
+
+Merely obtaining, downloading, cloning, viewing, or inspecting the source code without compiling, executing, or otherwise running the Software does not begin the Evaluation Period.
+
+A new download, copy, installation, version, release, environment, employee, contractor, or substantially similar assessment does not restart or extend an Evaluation Period for the same contemplated use.
+
+**"Evaluation"** means temporary, non-operational use of the Software during the applicable Evaluation Period solely and directly to assess its functionality, suitability, compatibility, performance, security, reliability, or fitness for a contemplated use, including to decide whether to obtain a separate license.
+
+Evaluation may include compiling, executing, testing, benchmarking, auditing, inspecting, or integrating the Software in a test or proof-of-concept environment only to the extent reasonably necessary to conduct that assessment.
+
+Evaluation does not include:
+
+(a) use of the Software to perform an actual production, business, organizational, administrative, infrastructure, service-delivery, customer-facing, or other operational function;
+
+(b) use of the Software as a substitute, whether temporary or permanent, for software or services that would otherwise perform such a function;
+
+(c) use of the Software to process or support a live or ongoing workload, except to the minimum extent reasonably necessary to reproduce or simulate that workload solely for Evaluation;
+
+(d) use of the Software to provide any product, service, result, output, or other benefit to a third party as part of an actual service or operational activity;
+
+(e) recurring or ongoing use after the assessment for which the Software was being evaluated has reasonably concluded; or
+
+(f) compiling, executing, or otherwise running the Software after expiration of the applicable Evaluation Period, unless permitted by a separate written agreement with the Licensor or by mandatory applicable law.
+
+**"Commercial Use"** means use of the Software in connection with a trade, business, profession, paid engagement, revenue-generating activity, commercial product or service, or internal business process. Evaluation permitted by Section 3 is not Commercial Use.
+
+**"Production Use"** means use of the Software in a live or deployed environment where the Software, or results produced by it, are relied upon to provide functionality, processing, infrastructure, or services to actual users, customers, employees, systems, devices, or operational processes. Evaluation is not Production Use.
+
+**"Operational Use"** means recurring, ongoing, or otherwise non-evaluative use of the Software as part of the actual activities, administration, infrastructure, workflows, service delivery, or other operations of any person or organization, whether commercial or non-commercial.
+
+Use does not cease to be Evaluation merely because it is performed by or on infrastructure belonging to a business, university, research institution, nonprofit organization, public authority, or other organization, provided that the use otherwise satisfies the definition of Evaluation.
+
+Automated build, continuous-integration, or similar automated execution of the Software is permitted only where reasonably necessary for an activity permitted by Section 3 and is not itself part of a production, deployment, service-delivery, or operational workflow.
+
+## 3. LIMITED LICENSE FOR INSPECTION AND EVALUATION
+
+Subject to the terms of this License, the Licensor grants the Licensee a limited, non-exclusive, non-transferable, and non-sublicensable right to exercise the permissions set forth in this Section 3.
+
+The rights granted by this Section 3 may be exercised by the Licensee and, where the Licensee is a legal entity, by its Authorized Personnel solely on the Licensee's behalf. Except for viewing and inspecting source code without executing the Software, rights constituting Evaluation may be exercised only during the applicable Evaluation Period.
+
+Subject to the foregoing, the Licensee may:
+
+(a) view and inspect the source code;
+
+(b) make copies reasonably necessary for inspection, Evaluation, testing, auditing, or security research; and
+
+(c) compile or execute the Software solely where reasonably necessary for Evaluation, testing, auditing, or security research.
+
+Each permission granted by this Section 3 is limited to the purposes expressly stated above. No license is granted to reproduce, adapt, modify, distribute, communicate or make available to the public, or otherwise exercise any right reserved to the copyright holder under applicable law in or with respect to the Software for Commercial Use, Production Use, or Operational Use.
+
+To the extent that loading, running, deploying, operating, integrating, or otherwise using the Software requires reproduction, adaptation, modification, or another act reserved to the copyright holder under applicable law, permission to perform that act is granted only to the extent reasonably necessary for Evaluation, testing, auditing, or security research permitted by this Section 3.
+
+The permissions granted in this Section 3 are expressly conditioned upon compliance with Section 4. Any reproduction, adaptation, modification, distribution, communication or making available to the public, or other exercise of a right reserved to the copyright holder outside the scope expressly permitted by this License is not licensed, except to the extent permitted independently by mandatory applicable law or a separate written agreement with the Licensor.
+
+Any rights arising independently from the functionality or terms of a source-code hosting platform remain subject to that platform's terms and are limited to the scope expressly granted by those terms. They do not enlarge the rights granted under this License outside that independent scope.
+
+## 4. RESTRICTIONS
+
+Except as expressly permitted by this License, mandatory applicable law, or a separate written agreement with the Licensor, you may not:
+
+(a) use, deploy, or operate the Software for Commercial Use, Production Use, or Operational Use;
+
+(b) sell, license, sublicense, rent, lease, host, provide as a service, or otherwise commercially exploit the Software;
+
+(c) use the Software to provide products or services to third parties;
+
+(d) distribute, publish, or provide copies of the Software or derivative works to third parties, except through functionality expressly provided by the source-code hosting platform on which the Software was originally made available and only to the extent permitted by that platform's terms;
+
+(e) modify, adapt, translate, or create derivative works of the Software except where reasonably necessary for Evaluation, testing, auditing, or security research permitted by Section 3;
+
+(f) distribute or commercially use any modification or derivative work;
+
+(g) incorporate the Software, or any substantial or otherwise copyright-protected portion of it, into another product, service, appliance, system, or codebase, except where reasonably necessary for Evaluation permitted by Section 3; or
+
+(h) remove, alter, or obscure any copyright, license, trademark, attribution, or other proprietary notice contained in the Software.
+
+For the avoidance of doubt, where conduct prohibited by this Section involves reproduction, adaptation, modification, distribution, communication or making available to the public, or another act reserved to the copyright holder under applicable law, the permissions granted by Section 3 do not extend to that act.
+
+A restriction in this Section that applies to conduct not involving a right reserved to the copyright holder operates as a contractual restriction to the extent enforceable under applicable law.
+
+## 5. MANDATORY STATUTORY RIGHTS
+
+Nothing in this License restricts or excludes any right that cannot lawfully be restricted or excluded by agreement.
+
+In particular, where German copyright law applies, nothing in this License restricts rights arising under Sections 69d and 69e of the German Copyright Act to the extent that contractual restrictions of those rights are prohibited by Section 69g of that Act.
+
+Any permission or right arising directly under mandatory applicable law applies independently of the permissions granted by this License.
+
+## 6. SECURITY RESEARCH
+
+Good-faith security research is permitted to the extent allowed by Section 3 or applicable law.
+
+This License does not authorize access to systems, networks, accounts, credentials, data, devices, or infrastructure that you do not own or for which you do not otherwise have authorization.
+
+## 7. OWNERSHIP AND RESERVATION OF RIGHTS
+
+The Software is licensed, not sold.
+
+The Licensor retains all rights in and to the Software, including all copyrights and other intellectual-property rights, except rights belonging to third parties.
+
+No rights are granted by implication, estoppel, possession of or access to the source code, publication of the source code, or otherwise. All rights not expressly granted by this License are reserved.
+
+## 8. THIRD-PARTY SOFTWARE
+
+The Software may depend on, include, link to, or be distributed alongside third-party software.
+
+Third-party software remains governed by its respective license terms, and nothing in this License limits rights granted directly by a third-party licensor.
+
+## 9. TRADEMARK AND PATENT RIGHTS
+
+This License does not grant permission to use the names, trademarks, service marks, logos, or branding of Microtun or the Licensor except as reasonably necessary to identify the Software or describe its origin.
+
+No use may imply endorsement, sponsorship, affiliation, or approval by the Licensor without prior written permission.
+
+Subject to the terms and conditions of this License, the Licensor grants the Licensee a limited, non-exclusive, non-transferable, and non-sublicensable license under any patent claims owned or controlled by the Licensor that would necessarily be infringed solely by exercising the rights expressly granted under Section 3.
+
+That patent license:
+
+(a) applies only to the extent necessary to exercise rights expressly permitted by Section 3;
+
+(b) applies only for inspection, Evaluation, testing, auditing, or security research permitted by this License;
+
+(c) does not authorize Commercial Use, Production Use, Operational Use, distribution, commercial exploitation, or any other activity not expressly permitted by this License;
+
+(d) does not extend to any combination of the Software with other software, hardware, systems, products, or services except to the extent reasonably necessary for an activity expressly permitted by Section 3;
+
+(e) does not grant any right to make, have made, sell, offer for sale, import, license, sublicense, distribute, or otherwise exploit any product or service incorporating or based upon the Software; and
+
+(f) terminates automatically when the corresponding rights under Section 3 expire or terminate.
+
+Except for the limited patent license expressly stated above and to the extent required by applicable law, no patent rights are granted under this License. Any broader patent license must be granted separately in writing by the Licensor.
+
+## 10. SEPARATE AGREEMENTS
+
+A separate written agreement governing your use of the Software takes precedence over this License to the extent of any conflict and grants rights only according to its terms.
+
+## 11. TERMINATION
+
+The rights granted under this License terminate if you materially breach this License and fail to remedy the breach where the breach is capable of remedy.
+
+No opportunity to remedy is required where the breach is intentional, cannot reasonably be remedied, or where applicable law permits immediate termination.
+
+Acts outside the scope of the rights granted by this License are not authorized by this License, irrespective of whether termination has occurred under this Section.
+
+Upon termination, you must cease exercising rights granted solely under this License.
+
+Termination does not affect rights arising independently under mandatory law, third-party licenses, or a separate written agreement.
+
+## 12. WARRANTY AND LIABILITY
+
+The Software is made available without charge for transparency, inspection, security research, auditing, and Evaluation.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, AND EXCEPT AS EXPRESSLY AGREED OTHERWISE IN WRITING, THE SOFTWARE IS PROVIDED "AS IS" AND "WITH ALL FAULTS," WITHOUT WARRANTIES, CONDITIONS, OR GUARANTEES OF ANY KIND, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING ANY IMPLIED WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, ACCURACY, RELIABILITY, SECURITY, AVAILABILITY, OR ABSENCE OF DEFECTS.
+
+Nothing in the preceding paragraph excludes or limits any warranty, guarantee, statutory right, remedy, or liability that cannot lawfully be excluded or limited. In particular, the preceding paragraph does not limit the liability expressly preserved below.
+
+The Licensor shall be liable without limitation:
+
+(a) for damage caused intentionally or by gross negligence;
+
+(b) for injury to life, body, or health caused intentionally or negligently;
+
+(c) where liability arises from an expressly assumed guarantee;
+
+(d) in cases of fraudulent concealment; and
+
+(e) where liability is mandatory under applicable law, including the German Product Liability Act.
+
+In cases of ordinary negligence, the Licensor shall be liable only for breach of an essential contractual obligation, meaning an obligation whose performance is necessary for the proper performance of this License and on whose performance the licensee may ordinarily rely. In such cases, liability shall be limited to damage that was foreseeable and typical for this type of agreement at the time the License became applicable.
+
+Subject to the foregoing provisions, liability for ordinary negligence is excluded.
+
+These limitations also apply for the benefit of the Licensor's representatives, agents, employees, and other persons for whom the Licensor is legally responsible.
+
+Statutory rights and liabilities that cannot lawfully be excluded or limited remain unaffected.
+
+## 13. GOVERNING LAW AND JURISDICTION
+
+This License and any dispute arising out of or in connection with it shall be governed by the laws of the Federal Republic of Germany, excluding its conflict-of-laws rules and the United Nations Convention on Contracts for the International Sale of Goods.
+
+Where the licensee is a consumer, this choice of law does not deprive the licensee of any protection afforded by mandatory provisions of the law that would apply in the absence of this choice of law.
+
+To the extent permitted by applicable law, if the licensee is a merchant, a legal entity under public law, or a special fund under public law, the courts having jurisdiction at the Licensor's principal place of business shall have exclusive jurisdiction over disputes arising out of or in connection with this License.
+
+Otherwise, jurisdiction shall be determined in accordance with applicable law.
+
+## 14. SEVERABILITY
+
+If any provision of this License is wholly or partly invalid or unenforceable, the remaining provisions shall remain unaffected to the extent permitted by applicable law.
+
+Any resulting gap shall be governed by applicable statutory law.

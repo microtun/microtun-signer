@@ -1,0 +1,115 @@
+# microtun signer - identity/policy example configuration.
+
+[Microtun]
+ApiVersion = "microtun.dev/v1alpha1"
+Kind = "SignerConfig"
+
+[Server]
+# Bind the Rust process only to loopback/private networking. Terminate HTTPS/mTLS
+# at an internal reverse proxy or load balancer. Public routes are served from the
+# domain root (for example /healthz and /v1/sign/{key_id}).
+Listen = "127.0.0.1:8080"
+# Binding anything other than a loopback address is refused unless
+# AllowNonLoopbackListen = true is set: the signer speaks plain HTTP and bearer
+# credentials must only cross a TLS-protected path.
+# AllowNonLoopbackListen = false
+
+# Manual key unlocks use a separate local-only HTTP API over this Unix-domain
+# socket. Do not reverse-proxy or expose this socket. The packaged systemd unit
+# creates the parent RuntimeDirectory.
+AdminSocketPath = "/run/microtun-signer/admin.sock"
+AdminSocketMode = 0o660
+# Operators who unlock keys are members of this group only. It is deliberately
+# NOT the service group, so operators cannot read the encrypted key file or the
+# service configuration. The service must be a member (SupplementaryGroups=).
+AdminSocketGroup = "microtun-signer-operators"
+
+# This deployment uses one firmware signing key. The key ID is immutable and is
+# referenced by the signing URL and authorization policies below.
+[[Key]]
+ID = "microtun-firmware-prod"
+# Required. Supported values: "ed25519" and "secp256k1".
+Algorithm = "ed25519"
+PEMPath = "/etc/microtun-signer/firmware-signing-key.encrypted.pem"
+State = "active"
+# The key must be encrypted with PBES2/AES-256 and either scrypt (r >= 8,
+# N*p >= 2^17) or PBKDF2-HMAC-SHA-256/512 with >= 600000 iterations, e.g.:
+#   openssl pkcs8 -topk8 -v2 aes-256-cbc -scrypt \
+#     -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 -in plain.pem -out encrypted.pem
+# No passphrase credential is configured here. Active keys always start locked;
+# an operator must run microtun-signer unlock --key-id <key-id> after each service start.
+
+# Human identities authenticate through THIS signer's GitHub OAuth App using
+# GitHub's device flow. Enable Device Flow in the OAuth App settings. Keep the
+# client secret outside this TOML file; the service reads it only from the
+# systemd credential named below ($CREDENTIALS_DIRECTORY/<name>).
+#
+# The CLI requests read:user so GitHub reports whether the account has 2FA. The
+# signer verifies that the temporary token belongs to this exact OAuth App and
+# revokes it before issuing a short-lived signer-local session.
+[GitHub]
+APIURL = "https://api.github.com"
+APIVersion = "2026-03-10"
+OAuthAccessTokenURL = "https://github.com/login/oauth/access_token"
+OAuthDeviceCodeURL = "https://github.com/login/device/code"
+OAuthClientID = "Ov23liEXAMPLE"
+OAuthClientSecretCredential = "github-oauth-client-secret"
+# Human sessions sign without build provenance, so keep them short
+# (default 900, maximum 3600).
+OAuthSessionTTLSeconds = 900
+
+# GitHub Actions OIDC verifier infrastructure. Repository/workflow trust belongs
+# to the github-actions Identity below, not to this verifier block.
+[GitHubActions]
+Audience = "microtun-signer"
+JWKSURL = "https://token.actions.githubusercontent.com/.well-known/jwks"
+JWKSTTLSeconds = 3600
+
+# A real GitHub account. GitHubUserID is the authorization anchor; GitHubLogin is
+# optional defense-in-depth/readability and can be updated if the account is renamed.
+[[Identity]]
+ID = "firmware-maintainer"
+Type = "github-account"
+GitHubUserID = "24681012"
+GitHubLogin = "maintainer-login"
+
+# A GitHub Actions identity is anchored to the immutable repository numeric ID.
+# Repository is optional, but catches unexpected transfers/renames until config is
+# deliberately updated.
+[[Identity]]
+ID = "microtun-release-actions"
+Type = "github-actions"
+RepositoryID = "123456789"
+Repository = "owner/microtun"
+
+# These repository/workflow claims are part of the identity itself. A token
+# that fails them does not authenticate as microtun-release-actions, regardless
+# of its RepositoryID. Multiple identities may share a RepositoryID as long as
+# their constraints distinguish them (for example release vs nightly workflows).
+WorkflowPath = ".github/workflows/release.yml"
+AllowedEventNames = ["push"]
+AllowedRefTypes = ["tag"]
+# Required for sign policies. Configure the environment's deployment rules to
+# allow only protected tags (and ideally required reviewers). Anyone who can
+# push a tag controls the workflow file at that tag, so the environment - not
+# tag creation - must be the signing gate.
+RequiredEnvironment = "firmware-signing"
+# Sign policies additionally require the tag to be protected by a GitHub
+# ruleset (the OIDC ref_protected claim). Add a tag ruleset for v* that
+# restricts creation, update and deletion.
+# Optional: require GitHub-hosted or self-hosted runners.
+# RequiredRunnerEnvironment = "github-hosted"
+# Optional: pin the release workflow revision(s) with full commit SHAs. Omit
+# the field to disable pinning; an empty list is rejected.
+# AllowedWorkflowSHAs = ["0123456789abcdef0123456789abcdef01234567"]
+
+[[Policy]]
+Identity = "firmware-maintainer"
+Actions = ["sign"]
+Keys = ["microtun-firmware-prod"]
+
+# Release workflow identity: may sign only with the current production key.
+[[Policy]]
+Identity = "microtun-release-actions"
+Actions = ["sign"]
+Keys = ["microtun-firmware-prod"]
