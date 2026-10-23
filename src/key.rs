@@ -1,11 +1,11 @@
 use std::{collections::HashMap, fs, path::Path, sync::RwLock};
 
 use anyhow::{Context, Result, bail};
-use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey};
 use k256::ecdsa::{
     Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey,
     signature::hazmat::PrehashSigner,
 };
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
 use rand::rngs::OsRng;
 use rsa::{
@@ -66,8 +66,9 @@ pub struct KeyMaterial {
     unlocked: RwLock<Option<UnlockedKeyMaterial>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum UnlockedKeyMaterial {
-    Ed25519(Ed25519SigningKey),
+    P256(P256SigningKey),
     Secp256k1(Secp256k1SigningKey),
     RsaPss(RsaPssSigningKey<Sha256>),
 }
@@ -166,7 +167,7 @@ impl KeyMaterial {
         let guard = self.unlocked.read().ok()?;
         let key = guard.as_ref()?;
         let mut pem = match key {
-            UnlockedKeyMaterial::Ed25519(signing_key) => signing_key
+            UnlockedKeyMaterial::P256(signing_key) => signing_key
                 .verifying_key()
                 .to_public_key_pem(LineEnding::LF)
                 .ok()?,
@@ -200,11 +201,11 @@ impl KeyMaterial {
         }
 
         let unlocked = match self.algorithm {
-            KeyAlgorithm::Ed25519 => Ed25519SigningKey::from_pkcs8_encrypted_pem(
+            KeyAlgorithm::P256 => P256SigningKey::from_pkcs8_encrypted_pem(
                 self.encrypted_pem.as_str(),
                 passphrase.as_bytes(),
             )
-            .map(UnlockedKeyMaterial::Ed25519)
+            .map(UnlockedKeyMaterial::P256)
             .map_err(|_| UnlockError::InvalidPassphrase)?,
             KeyAlgorithm::Secp256k1 => Secp256k1SigningKey::from_pkcs8_encrypted_pem(
                 self.encrypted_pem.as_str(),
@@ -236,8 +237,10 @@ impl KeyMaterial {
         let guard = self.unlocked.read().map_err(|_| SignError::Failed)?;
         let key = guard.as_ref().ok_or(SignError::Locked)?;
         match key {
-            UnlockedKeyMaterial::Ed25519(signing_key) => {
-                let signature: Ed25519Signature = signing_key.sign(digest);
+            UnlockedKeyMaterial::P256(signing_key) => {
+                let signature: P256Signature = signing_key
+                    .sign_prehash(digest)
+                    .map_err(|_| SignError::Failed)?;
                 Ok(signature.to_bytes().to_vec())
             }
             UnlockedKeyMaterial::Secp256k1(signing_key) => {
@@ -457,7 +460,6 @@ fn load_credential_from(directory: &Path, name: &str, label: &str) -> Result<Zer
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Verifier, VerifyingKey as Ed25519VerifyingKey};
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
     use rsa::pss::VerifyingKey as RsaPssVerifyingKey;
 
@@ -466,17 +468,17 @@ mod tests {
     fn test_key(id: &str, state: KeyState) -> KeyMaterial {
         KeyMaterial {
             id: id.into(),
-            algorithm: KeyAlgorithm::Ed25519,
+            algorithm: KeyAlgorithm::P256,
             state,
             encrypted_pem: Zeroizing::new(
-                include_str!("../tests/fixtures/test-ed25519-encrypted.pem").to_owned(),
+                include_str!("../tests/fixtures/test-p256-scrypt.pem").to_owned(),
             ),
             unlocked: RwLock::new(None),
         }
     }
 
     #[test]
-    fn encrypted_ed25519_key_starts_locked_then_unlocks_and_signs_exact_digest() {
+    fn encrypted_p256_key_starts_locked_then_unlocks_and_signs_exact_digest_prehash() {
         let key = test_key("test-key", KeyState::Active);
         assert!(!key.is_unlocked());
         assert!(key.public_key_pem().is_none());
@@ -497,14 +499,17 @@ mod tests {
 
         let digest = [0x5a; 32];
         let signature_bytes = key.sign_digest(&digest).unwrap();
-        let signature = Ed25519Signature::from_slice(&signature_bytes).unwrap();
-        let signing_key = Ed25519SigningKey::from_pkcs8_encrypted_pem(
-            include_str!("../tests/fixtures/test-ed25519-encrypted.pem"),
+        assert_eq!(signature_bytes.len(), 64);
+        let signature = P256Signature::from_slice(&signature_bytes).unwrap();
+        let signing_key = P256SigningKey::from_pkcs8_encrypted_pem(
+            include_str!("../tests/fixtures/test-p256-scrypt.pem"),
             b"test-passphrase",
         )
         .unwrap();
-        let verifying_key = Ed25519VerifyingKey::from(&signing_key);
-        verifying_key.verify(&digest, &signature).unwrap();
+        signing_key
+            .verifying_key()
+            .verify_prehash(&digest, &signature)
+            .unwrap();
         assert!(
             key.public_key_pem()
                 .unwrap()
@@ -579,8 +584,21 @@ mod tests {
     fn configured_key_algorithm_must_match_private_key_type() {
         let key = KeyMaterial::from_pem_with_algorithm_for_tests(
             "wrong-algorithm",
-            KeyAlgorithm::Ed25519,
+            KeyAlgorithm::P256,
             include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"),
+        );
+        assert!(matches!(
+            key.unlock("test-passphrase"),
+            Err(UnlockError::InvalidPassphrase)
+        ));
+    }
+
+    #[test]
+    fn p256_and_secp256k1_keys_are_not_interchangeable() {
+        let key = KeyMaterial::from_pem_with_algorithm_for_tests(
+            "wrong-curve",
+            KeyAlgorithm::Secp256k1,
+            include_str!("../tests/fixtures/test-p256-scrypt.pem"),
         );
         assert!(matches!(
             key.unlock("test-passphrase"),
@@ -611,9 +629,9 @@ mod tests {
     fn weak_key_encryption_is_rejected() {
         // The original fixture uses openssl's default of 2048 PBKDF2 iterations.
         for weak in [
-            include_str!("../tests/fixtures/test-ed25519-encrypted.pem"),
-            include_str!("../tests/fixtures/test-ed25519-scrypt-weak.pem"),
-            include_str!("../tests/fixtures/test-ed25519-aes128.pem"),
+            include_str!("../tests/fixtures/test-p256-encrypted.pem"),
+            include_str!("../tests/fixtures/test-p256-scrypt-weak.pem"),
+            include_str!("../tests/fixtures/test-p256-aes128.pem"),
         ] {
             assert!(enforce_key_encryption_policy(weak).is_err());
         }
@@ -622,8 +640,8 @@ mod tests {
     #[test]
     fn strong_key_encryption_is_accepted() {
         for strong in [
-            include_str!("../tests/fixtures/test-ed25519-scrypt.pem"),
-            include_str!("../tests/fixtures/test-ed25519-pbkdf2-600k.pem"),
+            include_str!("../tests/fixtures/test-p256-scrypt.pem"),
+            include_str!("../tests/fixtures/test-p256-pbkdf2-600k.pem"),
             include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"),
         ] {
             enforce_key_encryption_policy(strong).unwrap();
@@ -632,8 +650,8 @@ mod tests {
 
     #[test]
     fn documented_scrypt_parameters_unlock_in_rust() {
-        Ed25519SigningKey::from_pkcs8_encrypted_pem(
-            include_str!("../tests/fixtures/test-ed25519-scrypt.pem"),
+        P256SigningKey::from_pkcs8_encrypted_pem(
+            include_str!("../tests/fixtures/test-p256-scrypt.pem"),
             b"test-passphrase",
         )
         .unwrap();
@@ -707,12 +725,12 @@ mod tests {
         let strong = dir.join("strong.pem");
         fs::write(
             &weak,
-            include_str!("../tests/fixtures/test-ed25519-encrypted.pem"),
+            include_str!("../tests/fixtures/test-p256-encrypted.pem"),
         )
         .unwrap();
         fs::write(
             &strong,
-            include_str!("../tests/fixtures/test-ed25519-pbkdf2-600k.pem"),
+            include_str!("../tests/fixtures/test-p256-pbkdf2-600k.pem"),
         )
         .unwrap();
         for path in [&weak, &strong] {
@@ -720,7 +738,7 @@ mod tests {
         }
         let config = |path: &std::path::Path| KeyConfig {
             id: "k".into(),
-            algorithm: KeyAlgorithm::Ed25519,
+            algorithm: KeyAlgorithm::P256,
             pem_path: path.to_path_buf(),
             state: KeyState::Active,
             passphrase_credential: None,

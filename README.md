@@ -10,7 +10,7 @@ It supports:
 
 ## Supported algorithms
 
-- Ed25519
+- P-256 (secp256r1 / prime256v1)
 - secp256k1 (RPI Pico 2)
 - RSA-PSS (Espressif ESP32)
 
@@ -28,12 +28,14 @@ Edit `config.toml` with your server, GitHub, access-policy, and signing-key sett
 ## Signing key
 
 The private key must be encrypted PKCS#8. Every `[[Key]]` must explicitly set
-`Algorithm = "ed25519"`, `Algorithm = "secp256k1"`, or `Algorithm = "rsa-pss"`.
+`Algorithm = "p256"` (also accepts `"secp256r1"`),
+`Algorithm = "secp256k1"`, or `Algorithm = "rsa-pss"`.
 
-Ed25519 example:
+P-256 / secp256r1 example:
 
 ```bash
-openssl genpkey -algorithm ED25519 | openssl pkcs8 -topk8 \
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 | \
+  openssl pkcs8 -topk8 \
   -v2 aes-256-cbc \
   -scrypt -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 \
   -out firmware-signing-key.encrypted.pem
@@ -104,10 +106,11 @@ MICROTUN_SIGNER_TOKEN="$TOKEN" \
   --digest "$DIGEST_BASE64"
 ```
 
-On success, the command writes only the base64 signature to stdout. Ed25519
-signatures are 64 bytes. secp256k1 signatures are ECDSA over the supplied digest
-and use the fixed-width 64-byte `r || s` encoding (32-byte big-endian `r`, then
-32-byte big-endian `s`). RSA-PSS signatures are 256 bytes for RSA-2048 and 384
+On success, the command writes only the base64 signature to stdout. P-256
+(secp256r1) and secp256k1 signatures are ECDSA over the supplied 32-byte SHA-256
+digest (treated as a prehash, **not hashed again**) and use the fixed-width
+64-byte `r || s` encoding (32-byte big-endian `r`, then 32-byte big-endian `s`;
+**not** ASN.1 DER). RSA-PSS signatures are 256 bytes for RSA-2048 and 384
 bytes for RSA-3072.
 
 ## Get a public key

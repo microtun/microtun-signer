@@ -1173,8 +1173,8 @@ mod tests {
         let keys = KeyRing::from_keys_for_tests(vec![
             crate::key::KeyMaterial::from_pem_with_algorithm_for_tests(
                 "prod",
-                crate::config::KeyAlgorithm::Ed25519,
-                include_str!("../tests/fixtures/test-ed25519-scrypt.pem"),
+                crate::config::KeyAlgorithm::P256,
+                include_str!("../tests/fixtures/test-p256-scrypt.pem"),
             ),
         ]);
         AdminState::new(Arc::new(keys))

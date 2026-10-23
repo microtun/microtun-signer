@@ -87,7 +87,8 @@ pub struct KeyConfig {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyAlgorithm {
-    Ed25519,
+    #[serde(alias = "secp256r1")]
+    P256,
     Secp256k1,
     #[serde(rename = "rsa-pss")]
     RsaPss,
@@ -96,7 +97,7 @@ pub enum KeyAlgorithm {
 impl KeyAlgorithm {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Ed25519 => "ed25519",
+            Self::P256 => "p256",
             Self::Secp256k1 => "secp256k1",
             Self::RsaPss => "rsa-pss",
         }
@@ -679,7 +680,7 @@ Listen = "127.0.0.1:8080"
 
 [[Key]]
 ID = "test-key"
-Algorithm = "ed25519"
+Algorithm = "p256"
 PEMPath = "/tmp/test-key.pem"
 
 [GitHub]
@@ -715,17 +716,24 @@ Keys = ["test-key"]
 "#,
         );
         let config: Config = toml::from_str(&text).unwrap();
-        assert_eq!(config.keys[0].algorithm, KeyAlgorithm::Ed25519);
+        assert_eq!(config.keys[0].algorithm, KeyAlgorithm::P256);
 
-        let secp = text.replace("Algorithm = \"ed25519\"", "Algorithm = \"secp256k1\"");
+        let secp = text.replace("Algorithm = \"p256\"", "Algorithm = \"secp256k1\"");
         let config: Config = toml::from_str(&secp).unwrap();
         assert_eq!(config.keys[0].algorithm, KeyAlgorithm::Secp256k1);
 
-        let rsa_pss = text.replace("Algorithm = \"ed25519\"", "Algorithm = \"rsa-pss\"");
+        let rsa_pss = text.replace("Algorithm = \"p256\"", "Algorithm = \"rsa-pss\"");
         let config: Config = toml::from_str(&rsa_pss).unwrap();
         assert_eq!(config.keys[0].algorithm, KeyAlgorithm::RsaPss);
 
-        let missing = text.replace("Algorithm = \"ed25519\"\n", "");
+        let secp256r1 = text.replace("Algorithm = \"p256\"", "Algorithm = \"secp256r1\"");
+        let config: Config = toml::from_str(&secp256r1).unwrap();
+        assert_eq!(config.keys[0].algorithm, KeyAlgorithm::P256);
+
+        let ed25519 = text.replace("Algorithm = \"p256\"", "Algorithm = \"ed25519\"");
+        assert!(toml::from_str::<Config>(&ed25519).is_err());
+
+        let missing = text.replace("Algorithm = \"p256\"\n", "");
         assert!(toml::from_str::<Config>(&missing).is_err());
     }
 
