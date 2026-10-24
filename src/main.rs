@@ -83,7 +83,7 @@ struct AdminSocketArgs {
 #[derive(Debug, clap::Args)]
 struct UnlockArgs {
     /// Immutable signing key ID to unlock.
-    #[arg(short = 'k', long = "key-id")]
+    #[arg(short = 'k', long = "key-id", env = "MICROTUN_SIGNER_KEY_ID")]
     key_id: String,
 
     #[command(flatten)]

@@ -16,7 +16,7 @@ use crate::{session_cache, valid_key_id};
 #[derive(Debug, Args)]
 pub struct SignArgs {
     /// Immutable signing key ID to use.
-    #[arg(short = 'k', long = "key-id")]
+    #[arg(short = 'k', long = "key-id", env = "MICROTUN_SIGNER_KEY_ID")]
     key_id: String,
 
     /// Bearer credential accepted by the signer. Prefer MICROTUN_SIGNER_TOKEN
@@ -27,29 +27,30 @@ pub struct SignArgs {
     /// Authenticate as a GitHub user, reusing a cached signer session when
     /// available. If login is required, GitHub's OAuth device flow is used.
     /// This takes precedence over MICROTUN_SIGNER_TOKEN/--token.
-    #[arg(long = "github-login", conflicts_with = "github_actions")]
+    #[arg(long = "github-login", env = "MICROTUN_SIGNER_GITHUB_LOGIN")]
     github_login: bool,
 
     /// Request a fresh GitHub Actions OIDC token for this signing operation.
     /// Requires a workflow/job with `id-token: write` permission and takes
     /// precedence over MICROTUN_SIGNER_TOKEN/--token.
-    #[arg(long = "github-actions", conflicts_with = "github_login")]
+    #[arg(long = "github-actions", env = "MICROTUN_SIGNER_GITHUB_ACTIONS")]
     github_actions: bool,
 
     /// OIDC audience, matching the signer's GitHubActions.Audience setting.
-    /// Defaults to "microtun-signer"; only valid with --github-actions.
-    #[arg(long, requires = "github_actions")]
+    /// Defaults to "microtun-signer"; only valid when using GitHub Actions OIDC
+    /// (explicitly or by automatic detection inside a GitHub Actions job).
+    #[arg(long, env = "MICROTUN_SIGNER_AUDIENCE")]
     audience: Option<String>,
 
     /// 32-byte MCUboot SHA-256 digest encoded as base64.
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, env = "MICROTUN_SIGNER_DIGEST")]
     digest: String,
 }
 
 #[derive(Debug, Args)]
 pub struct PublicKeyArgs {
     /// Immutable signing key ID to fetch.
-    #[arg(short = 'k', long = "key-id")]
+    #[arg(short = 'k', long = "key-id", env = "MICROTUN_SIGNER_KEY_ID")]
     key_id: String,
 }
 
@@ -97,6 +98,33 @@ struct ErrorBody {
 
 pub async fn sign(url: &str, args: SignArgs) -> Result<()> {
     validate_key_id(&args.key_id)?;
+
+    // Check parsed boolean values rather than clap argument presence, so an
+    // environment setting of `false` does not conflict with the other mode.
+    if args.github_login && args.github_actions {
+        bail!("--github-login and --github-actions are mutually exclusive");
+    }
+
+    // An audience is useful both for explicit --github-actions and for the
+    // automatic OIDC flow inside GitHub Actions. Reject it for other auth modes
+    // rather than silently ignoring an explicit flag or environment setting.
+    let use_actions = should_use_github_actions(
+        args.github_actions,
+        args.github_login,
+        args.token.is_some(),
+        env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some(),
+    );
+    if let Some(audience) = args.audience.as_deref() {
+        if !use_actions {
+            bail!(
+                "--audience/MICROTUN_SIGNER_AUDIENCE requires GitHub Actions authentication (--github-actions or automatic runner OIDC)"
+            );
+        }
+        if audience.trim().is_empty() {
+            bail!("--audience/MICROTUN_SIGNER_AUDIENCE must not be empty");
+        }
+    }
+
     let decoded = BASE64
         .decode(args.digest.as_bytes())
         .context("--digest must be valid base64")?;
@@ -112,12 +140,6 @@ pub async fn sign(url: &str, args: SignArgs) -> Result<()> {
 
     // GitHub injects these variables only into jobs with OIDC permission. Prefer
     // an explicitly selected authentication method when one was provided.
-    let use_actions = should_use_github_actions(
-        args.github_actions,
-        args.github_login,
-        args.token.is_some(),
-        env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some(),
-    );
     let (mut token, reused_cached_session) = if args.github_login {
         let cached = match session_cache::load(&base_url) {
             Ok(cached) => cached,
