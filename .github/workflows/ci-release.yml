@@ -61,7 +61,7 @@ jobs:
           fi
 
   build-amd64-assets:
-    name: Build release assets (amd64)
+    name: Build Debian packages (amd64)
     needs: release-gate
     runs-on: ubuntu-latest
     steps:
@@ -71,36 +71,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Debian packages and standalone binary
+      - name: Build Debian packages
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.debian
           platforms: linux/amd64
-          target: release-assets
+          target: debs
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=debs-amd64
           cache-to: type=gha,mode=max,scope=debs-amd64
 
-      - name: Verify release assets (amd64)
+      - name: Verify Debian packages (amd64)
         shell: bash
         run: |
           set -euo pipefail
           find dist -type f -name '*.deb' -print
           test -n "$(find dist -type f -name '*.deb' -print -quit)"
-          test -f dist/microtun-signer-linux-amd64
-          test -s dist/microtun-signer-linux-amd64
 
-      - name: Upload release assets (amd64)
+      - name: Upload Debian packages (amd64)
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
-          name: release-amd64
+          name: release-debs-amd64
           path: dist/
           if-no-files-found: error
 
   build-arm64-assets:
-    name: Build release assets (arm64)
+    name: Build Debian packages (arm64)
     if: startsWith(github.ref, 'refs/tags/')
     needs: release-gate
     runs-on: ubuntu-24.04-arm
@@ -111,31 +109,87 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Debian packages and standalone binary
+      - name: Build Debian packages
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.debian
           platforms: linux/arm64
-          target: release-assets
+          target: debs
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=debs-arm64
           cache-to: type=gha,mode=max,scope=debs-arm64
 
-      - name: Verify release assets (arm64)
+      - name: Verify Debian packages (arm64)
         shell: bash
         run: |
           set -euo pipefail
           find dist -type f -name '*.deb' -print
           test -n "$(find dist -type f -name '*.deb' -print -quit)"
-          test -f dist/microtun-signer-linux-arm64
-          test -s dist/microtun-signer-linux-arm64
 
-      - name: Upload release assets (arm64)
+      - name: Upload Debian packages (arm64)
         uses: actions/upload-artifact@v4
         with:
-          name: release-arm64
+          name: release-debs-arm64
           path: dist/
+          if-no-files-found: error
+
+  build-static-linux:
+    name: Build static Linux binary (${{ matrix.arch }})
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release-gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools binutils file
+
+      - name: Install Rust toolchain and musl target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup +1.98.1 target add ${{ matrix.rust_target }}
+
+      - name: Build static Linux binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo +1.98.1 build --release --locked --bin microtun-signer --target ${{ matrix.rust_target }}
+
+      - name: Verify and stage static binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.rust_target }}/release/microtun-signer"
+          test -s "$binary"
+          if readelf -l "$binary" | grep -q INTERP || readelf -d "$binary" | grep -q '(NEEDED)'; then
+            echo "::error::Binary contains a dynamic loader or shared library dependency: $binary"
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 0755 "$binary" "dist/microtun-signer-linux-${{ matrix.arch }}"
+          file "dist/microtun-signer-linux-${{ matrix.arch }}"
+
+      - name: Upload static Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-static-linux-${{ matrix.arch }}
+          path: dist/microtun-signer-linux-${{ matrix.arch }}
           if-no-files-found: error
 
   release:
@@ -144,6 +198,7 @@ jobs:
     needs:
       - build-amd64-assets
       - build-arm64-assets
+      - build-static-linux
     runs-on: ubuntu-latest
     permissions:
       contents: write
