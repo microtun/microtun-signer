@@ -1,8 +1,14 @@
-microtun-signer (0.9.0) UNRELEASED; urgency=medium
+microtun-signer (0.10.0) UNRELEASED; urgency=medium
+
+  * Simplify github actions usage 
+
+ -- Damian Peckett <damian@pecke.tt>  Sat, 24 Oct 2026 12:02:29 +0200
+
+microtun-signer (0.9.0) unstable; urgency=medium
 
   * Move from Ed25519 to P256 
 
- -- Damian Peckett <damian@pecke.tt>  Fri, 23 Oct 2026 15:21:31 +0200
+ -- Damian Peckett <damian@pecke.tt>  Sat, 24 Oct 2026 12:02:15 +0200
 
 microtun-signer (0.8.1) unstable; urgency=medium
 

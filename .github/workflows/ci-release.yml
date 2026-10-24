@@ -60,8 +60,8 @@ jobs:
             exit 1
           fi
 
-  build-amd64-debs:
-    name: Build DEBs (amd64)
+  build-amd64-assets:
+    name: Build release assets (amd64)
     needs: release-gate
     runs-on: ubuntu-latest
     steps:
@@ -71,34 +71,36 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Debian packages
+      - name: Build Debian packages and standalone binary
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.debian
           platforms: linux/amd64
-          target: debs
+          target: release-assets
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=debs-amd64
           cache-to: type=gha,mode=max,scope=debs-amd64
 
-      - name: Verify packages were built
+      - name: Verify release assets (amd64)
         shell: bash
         run: |
           set -euo pipefail
           find dist -type f -name '*.deb' -print
           test -n "$(find dist -type f -name '*.deb' -print -quit)"
+          test -f dist/microtun-signer-linux-amd64
+          test -s dist/microtun-signer-linux-amd64
 
-      - name: Upload Debian packages for release
+      - name: Upload release assets (amd64)
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
-          name: debs-amd64
-          path: dist/**/*.deb
+          name: release-amd64
+          path: dist/
           if-no-files-found: error
 
-  build-arm64-debs:
-    name: Build DEBs (arm64)
+  build-arm64-assets:
+    name: Build release assets (arm64)
     if: startsWith(github.ref, 'refs/tags/')
     needs: release-gate
     runs-on: ubuntu-24.04-arm
@@ -109,46 +111,48 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Debian packages
+      - name: Build Debian packages and standalone binary
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.debian
           platforms: linux/arm64
-          target: debs
+          target: release-assets
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=debs-arm64
           cache-to: type=gha,mode=max,scope=debs-arm64
 
-      - name: Verify packages were built
+      - name: Verify release assets (arm64)
         shell: bash
         run: |
           set -euo pipefail
           find dist -type f -name '*.deb' -print
           test -n "$(find dist -type f -name '*.deb' -print -quit)"
+          test -f dist/microtun-signer-linux-arm64
+          test -s dist/microtun-signer-linux-arm64
 
-      - name: Upload Debian packages for release
+      - name: Upload release assets (arm64)
         uses: actions/upload-artifact@v4
         with:
-          name: debs-arm64
-          path: dist/**/*.deb
+          name: release-arm64
+          path: dist/
           if-no-files-found: error
 
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
     needs:
-      - build-amd64-debs
-      - build-arm64-debs
+      - build-amd64-assets
+      - build-arm64-assets
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download Debian packages
+      - name: Download release assets
         uses: actions/download-artifact@v4
         with:
-          pattern: debs-*
+          pattern: release-*
           path: dist
           merge-multiple: true
 
@@ -164,7 +168,18 @@ jobs:
             exit 1
           fi
 
-          gh release create "$GITHUB_REF_NAME" "${debs[@]}" \
+          binaries=(
+            dist/microtun-signer-linux-amd64
+            dist/microtun-signer-linux-arm64
+          )
+          for binary in "${binaries[@]}"; do
+            if [[ ! -s "$binary" ]]; then
+              echo "::error::Missing standalone binary: $binary"
+              exit 1
+            fi
+          done
+
+          gh release create "$GITHUB_REF_NAME" "${debs[@]}" "${binaries[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes

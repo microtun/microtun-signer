@@ -96,7 +96,45 @@ The passphrase is entered interactively and is not accepted through command-line
   --digest "$DIGEST_BASE64"
 ```
 
-### Existing bearer token / GitHub Actions
+### GitHub Actions
+
+Grant the signing job `id-token: write` permission, then call the CLI directly:
+
+```yaml
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      # Build the firmware and set DIGEST_BASE64 in an earlier step.
+      - name: Sign firmware
+        run: |
+          microtun-signer sign \
+            --url https://signer.example.com/ \
+            --github-actions \
+            --key-id microtun-firmware-prod \
+            --digest "$DIGEST_BASE64"
+```
+
+Each `sign` invocation requests its own fresh OIDC JWT using GitHub's
+`ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` environment
+variables, and sends it directly as the signing API bearer token. No token is
+cached or printed. `--audience` defaults to `microtun-signer`, matching the
+server's default `[GitHubActions] Audience`; if the server is configured with a
+different audience, pass `--audience "your-configured-audience"` alongside
+`--github-actions`.
+
+When no other credential is selected, the CLI also automatically uses GitHub
+Actions OIDC if `ACTIONS_ID_TOKEN_REQUEST_URL` is present, so the
+`--github-actions` flag may be omitted in such a job. `--github-actions` takes
+precedence over `MICROTUN_SIGNER_TOKEN`/`--token` when explicitly supplied;
+`--github-login` is mutually exclusive with `--github-actions`. An explicitly
+provided bearer token takes precedence over automatic OIDC detection.
+
+### Existing bearer token
 
 ```bash
 MICROTUN_SIGNER_TOKEN="$TOKEN" \
