@@ -289,7 +289,9 @@ fn github_actions_request_url(request_url: &str, audience: &str) -> Result<reqwe
         || url.password().is_some()
         || url.fragment().is_some()
     {
-        bail!("ACTIONS_ID_TOKEN_REQUEST_URL must be a hierarchical HTTPS URL without credentials or a fragment");
+        bail!(
+            "ACTIONS_ID_TOKEN_REQUEST_URL must be a hierarchical HTTPS URL without credentials or a fragment"
+        );
     }
     if url.query_pairs().any(|(key, _)| key == "audience") {
         bail!("ACTIONS_ID_TOKEN_REQUEST_URL must not already specify an audience");
