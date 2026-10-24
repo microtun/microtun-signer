@@ -71,6 +71,15 @@ To confirm the setup on a running service:
 
 To withdraw access: `deluser alice microtun-signer-operators`.
 
+Keys that share a passphrase can be listed in a top-level [[Keyring]] in
+config.toml (with ID = "firmware-prod" and Keys = ["key-a", "key-b"]),
+then unlocked together with one prompt:
+
+  microtun-signer unlock --keyring firmware-prod
+
+The server resolves keyring membership itself, so operators still need no
+access to the configuration.
+
 The unlock subcommand uses the default socket path and does not read the service
 configuration unless --config is given explicitly, so operators need no access
 to /etc/microtun-signer. Human GitHub OAuth sessions exist only in
@@ -82,7 +91,8 @@ signing keys):
 
 The unlock subcommand reads the passphrase directly from the terminal with hidden
 input in Rust and never accepts the key passphrase as a command-line argument or
-environment variable. The service decrypts one key at a time, on a worker thread
+environment variable. The service decrypts one key at a time (a keyring
+unlock decrypts its members one after another), on a worker thread
 separate from request handling, so an unlock does not stall signing requests.
 
 GitHub OAuth client secret

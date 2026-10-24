@@ -84,6 +84,43 @@ Keys start locked after every service restart.
 
 The passphrase is entered interactively and is not accepted through command-line arguments or environment variables.
 
+### Unlock several keys at once
+
+Keys encrypted with the same passphrase can be grouped in a top-level
+`[[Keyring]]`. The keyring explicitly owns its member list:
+
+```toml
+[[Keyring]]
+ID = "firmware-prod"
+Keys = ["microtun-p256-prod", "microtun-esp32-prod"]
+
+[[Key]]
+ID = "microtun-p256-prod"
+Algorithm = "p256"
+PEMPath = "/etc/microtun-signer/p256-prod.encrypted.pem"
+
+[[Key]]
+ID = "microtun-esp32-prod"
+Algorithm = "rsa-pss"
+PEMPath = "/etc/microtun-signer/esp32-prod.encrypted.pem"
+```
+
+Keyring IDs must be unique, `Keys` must contain at least one existing key ID,
+and each key can belong to at most one keyring. Keys not listed in a keyring
+can still be unlocked individually. The `Keyring` field on `[[Key]]` is no
+longer supported.
+
+```bash
+./target/release/microtun-signer unlock --keyring firmware-prod
+```
+
+One passphrase prompt unlocks every active key in the keyring. The unlock is
+all-or-nothing: if the passphrase doesn't open every locked, active member,
+none of them are unlocked and the command names the keys that didn't match.
+Keys that are already unlocked are left alone, and retired or disabled keys are
+skipped. Results follow the order of the keyring's `Keys` list. Individual keys
+in a keyring can still be unlocked with `--key-id`.
+
 ## Sign firmware
 
 ### GitHub user

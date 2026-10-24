@@ -30,13 +30,14 @@ use zeroize::Zeroizing;
 
 use crate::{
     api::{
-        AdminState, AppState, create_signature, get_public_key, github_oauth_device_config,
-        github_oauth_device_exchange, health, unlock_key, version,
+        AdminState, AppState, KeyringUnlockResponse, create_signature, get_public_key,
+        github_oauth_device_config, github_oauth_device_exchange, health, unlock_key,
+        unlock_keyring, version,
     },
     auth::Authenticator,
     authorization::Authorizer,
-    config::{Config, DEFAULT_ADMIN_SOCKET_PATH},
-    key::KeyRing,
+    config::{Config, DEFAULT_ADMIN_SOCKET_PATH, valid_keyring_name},
+    key::KeyStore,
 };
 
 #[derive(Debug, Parser)]
@@ -63,7 +64,7 @@ enum Commands {
     /// Run the signer service.
     Serve,
 
-    /// Interactively unlock an active signing key.
+    /// Interactively unlock an active signing key, or every key in a keyring.
     Unlock(UnlockArgs),
 
     /// Sign a 32-byte MCUboot SHA-256 firmware digest.
@@ -81,10 +82,16 @@ struct AdminSocketArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(["key_id", "keyring"])))]
 struct UnlockArgs {
     /// Immutable signing key ID to unlock.
     #[arg(short = 'k', long = "key-id", env = "MICROTUN_SIGNER_KEY_ID")]
-    key_id: String,
+    key_id: Option<String>,
+
+    /// Keyring to unlock: every active key listed in its [[Keyring]].Keys is
+    /// unlocked with one passphrase, or none are.
+    #[arg(short = 'r', long = "keyring", env = "MICROTUN_SIGNER_KEYRING")]
+    keyring: Option<String>,
 
     #[command(flatten)]
     admin: AdminSocketArgs,
@@ -101,6 +108,8 @@ struct UnlockRequest<'a> {
 struct ErrorBody {
     error: String,
     request_id: String,
+    #[serde(default)]
+    keys: Vec<String>,
 }
 
 #[tokio::main]
@@ -130,19 +139,20 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     init_tracing();
     let config = Config::load(&config_path)?;
 
-    let keys = Arc::new(KeyRing::load(&config.keys)?);
+    let keys = Arc::new(KeyStore::load(&config.keys, &config.keyrings)?);
     for key in keys.iter() {
         tracing::info!(
             key_id = key.id(),
             key_algorithm = key.algorithm().as_str(),
             key_state = key.state().as_str(),
+            keyring = keys.keyring_for_key(key.id()).unwrap_or(""),
             lock_state = "locked",
             "registered encrypted firmware signing key"
         );
     }
     tracing::info!(
         key_count = keys.len(),
-        "firmware signing keyring loaded with all keys locked"
+        "firmware signing keys loaded with all keys locked"
     );
 
     let authenticator = Authenticator::new(
@@ -173,6 +183,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     // must never be added to the public TCP router or reverse-proxied.
     let admin_app = Router::new()
         .route("/v1/unlock/{key_id}", post(unlock_key))
+        .route("/v1/unlock-keyring/{keyring}", post(unlock_keyring))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -242,10 +253,15 @@ fn resolve_admin_socket(args: &AdminSocketArgs, config_path: Option<&Path>) -> R
     Ok(socket)
 }
 
-fn admin_client(socket: &Path) -> Result<reqwest::Client> {
+/// One unlock runs one deliberately expensive KDF; a keyring unlock runs one
+/// per locked member, back to back, so it gets a proportionally longer budget.
+const KEY_UNLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const KEYRING_UNLOCK_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn admin_client(socket: &Path, timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .unix_socket(socket)
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .build()
         .context("failed to create admin API client")
 }
@@ -254,6 +270,12 @@ async fn response_error(response: reqwest::Response, action: &str) -> anyhow::Er
     let status = response.status();
     match response.bytes().await {
         Ok(body) => match serde_json::from_slice::<ErrorBody>(&body) {
+            Ok(problem) if !problem.keys.is_empty() => anyhow::anyhow!(
+                "{action} failed: {} for key(s) {} (request {})",
+                problem.error,
+                problem.keys.join(", "),
+                problem.request_id
+            ),
             Ok(problem) => anyhow::anyhow!(
                 "{action} failed: {} (request {})",
                 problem.error,
@@ -265,20 +287,48 @@ async fn response_error(response: reqwest::Response, action: &str) -> anyhow::Er
     }
 }
 
+enum UnlockTarget {
+    Key(String),
+    Keyring(String),
+}
+
 async fn unlock(args: UnlockArgs, config_path: Option<&Path>) -> Result<()> {
-    if !valid_key_id(&args.key_id) {
-        bail!("--key-id must match [A-Za-z0-9._-]{{1,128}}");
-    }
+    // clap's "target" group guarantees exactly one of the two.
+    let target = match (args.key_id, args.keyring) {
+        (Some(key_id), None) => {
+            if !valid_key_id(&key_id) {
+                bail!("--key-id must match [A-Za-z0-9._-]{{1,128}}");
+            }
+            UnlockTarget::Key(key_id)
+        }
+        (None, Some(keyring)) => {
+            if !valid_keyring_name(&keyring) {
+                bail!("--keyring must match [A-Za-z0-9._-]{{1,128}}");
+            }
+            UnlockTarget::Keyring(keyring)
+        }
+        _ => bail!("exactly one of --key-id or --keyring is required"),
+    };
     let socket = resolve_admin_socket(&args.admin, config_path)?;
 
-    let prompt = format!("Passphrase for firmware signing key {}:", args.key_id);
+    let (prompt, url, timeout) = match &target {
+        UnlockTarget::Key(key_id) => (
+            format!("Passphrase for firmware signing key {key_id}:"),
+            format!("http://localhost/v1/unlock/{key_id}"),
+            KEY_UNLOCK_TIMEOUT,
+        ),
+        UnlockTarget::Keyring(keyring) => (
+            format!("Passphrase for keyring {keyring}:"),
+            format!("http://localhost/v1/unlock-keyring/{keyring}"),
+            KEYRING_UNLOCK_TIMEOUT,
+        ),
+    };
     let passphrase = ask_password(&prompt)?;
     if passphrase.is_empty() {
         bail!("empty passphrase refused");
     }
 
-    let url = format!("http://localhost/v1/unlock/{}", args.key_id);
-    let response = admin_client(&socket)?
+    let response = admin_client(&socket, timeout)?
         .post(url)
         .json(&UnlockRequest {
             passphrase: passphrase.as_str(),
@@ -295,7 +345,24 @@ async fn unlock(args: UnlockArgs, config_path: Option<&Path>) -> Result<()> {
         return Err(response_error(response, "unlock").await);
     }
 
-    println!("key {} is unlocked", args.key_id);
+    match target {
+        UnlockTarget::Key(key_id) => println!("key {key_id} is unlocked"),
+        UnlockTarget::Keyring(_) => {
+            let body: KeyringUnlockResponse = response
+                .json()
+                .await
+                .context("failed to read keyring unlock response")?;
+            for key in &body.keys {
+                let status = match key.result.as_str() {
+                    "unlocked" => "is unlocked",
+                    "already-unlocked" => "was already unlocked",
+                    "skipped-inactive" => "was skipped (not active)",
+                    other => other,
+                };
+                println!("key {} {status}", key.key_id);
+            }
+        }
+    }
     Ok(())
 }
 

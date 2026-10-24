@@ -24,6 +24,16 @@ AdminSocketMode = 0o660
 # service configuration. The service must be a member (SupplementaryGroups=).
 AdminSocketGroup = "microtun-signer-operators"
 
+# A keyring explicitly owns its list of signing keys. Add more key IDs here
+# if they share the same encryption passphrase; or remove the entire block if
+# this deployment doesn't need grouped unlocking.
+# One prompt unlocks all active members or none:
+#   microtun-signer unlock --keyring firmware-prod
+# Passphrases never appear in the configuration.
+[[Keyring]]
+ID = "firmware-prod"
+Keys = ["microtun-firmware-prod"]
+
 # This deployment uses one firmware signing key. The key ID is immutable and is
 # referenced by the signing URL and authorization policies below.
 [[Key]]
@@ -38,6 +48,8 @@ State = "active"
 #     -scrypt_N 16384 -scrypt_r 8 -scrypt_p 8 -in plain.pem -out encrypted.pem
 # No passphrase credential is configured here. Active keys always start locked;
 # an operator must run microtun-signer unlock --key-id <key-id> after each service start.
+# Keyring unlock is all-or-nothing: if the shared passphrase fails to open
+# any locked, active member, no newly decrypted key is installed.
 
 # Human identities authenticate through THIS signer's GitHub OAuth App using
 # GitHub's device flow. Enable Device Flow in the OAuth App settings. Keep the

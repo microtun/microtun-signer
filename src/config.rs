@@ -28,6 +28,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(rename = "Key")]
     pub keys: Vec<KeyConfig>,
+    #[serde(rename = "Keyring", default)]
+    pub keyrings: Vec<KeyringConfig>,
     #[serde(rename = "GitHub")]
     pub github: GithubConfig,
     #[serde(rename = "GitHubActions")]
@@ -82,6 +84,17 @@ pub struct KeyConfig {
     // are no longer loaded from environment/files/systemd credentials.
     #[serde(rename = "PassphraseCredential", default)]
     pub passphrase_credential: Option<String>,
+}
+
+/// Named group of encrypted keys that can be unlocked with one passphrase.
+/// Passphrases never appear in the configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyringConfig {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "Keys")]
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -308,6 +321,37 @@ impl Config {
                 bail!(
                     "Key.PassphraseCredential is no longer supported; signing keys start locked and must be unlocked through the local admin API"
                 );
+            }
+        }
+
+        let mut keyring_ids = HashSet::with_capacity(self.keyrings.len());
+        let mut member_owner = HashMap::new();
+        for keyring in &self.keyrings {
+            if !valid_keyring_name(&keyring.id) {
+                bail!("Keyring.ID must match [A-Za-z0-9._-]{{1,128}}");
+            }
+            if !keyring_ids.insert(keyring.id.as_str()) {
+                bail!("duplicate Keyring.ID {}", keyring.id);
+            }
+            if keyring.keys.is_empty() {
+                bail!("Keyring {} must contain at least one key", keyring.id);
+            }
+            for key_id in &keyring.keys {
+                if !key_ids.contains(key_id.as_str()) {
+                    bail!(
+                        "Keyring {} references unknown Key.ID {}",
+                        keyring.id,
+                        key_id
+                    );
+                }
+                if let Some(other) = member_owner.insert(key_id.as_str(), keyring.id.as_str()) {
+                    bail!(
+                        "Key {} is listed more than once in keyrings ({} and {})",
+                        key_id,
+                        other,
+                        keyring.id
+                    );
+                }
             }
         }
 
@@ -611,6 +655,10 @@ fn valid_group_name(value: &str) -> bool {
         && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
+pub fn valid_keyring_name(value: &str) -> bool {
+    valid_key_id(value)
+}
+
 fn valid_identity_id(value: &str) -> bool {
     valid_key_id(value)
 }
@@ -801,6 +849,67 @@ SocketPath = "/run/microtun-signer/unlock.sock"
         );
         let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
         assert!(error.contains("Unlock"));
+    }
+
+    #[test]
+    fn keyrings_are_optional_and_declared_at_the_top_level() {
+        let config = validate(&account_config()).unwrap();
+        assert!(config.keyrings.is_empty());
+
+        let text = format!(
+            "{}\n[[Keyring]]\nID = \"firmware-prod\"\nKeys = [\"test-key\"]\n",
+            account_config()
+        );
+        let config = validate(&text).unwrap();
+        assert_eq!(config.keyrings.len(), 1);
+        assert_eq!(config.keyrings[0].id, "firmware-prod");
+        assert_eq!(config.keyrings[0].keys, vec!["test-key".to_owned()]);
+    }
+
+    #[test]
+    fn top_level_keyrings_validate_names_and_membership() {
+        let with_rings = |rings: &str| format!("{}\n{rings}", account_config());
+        let invalid_cases = [
+            (
+                "[[Keyring]]\nID = \"\"\nKeys = [\"test-key\"]",
+                "Keyring.ID",
+            ),
+            (
+                "[[Keyring]]\nID = \"bad/name\"\nKeys = [\"test-key\"]",
+                "Keyring.ID",
+            ),
+            ("[[Keyring]]\nID = \"fw\"\nKeys = []", "at least one key"),
+            (
+                "[[Keyring]]\nID = \"fw\"\nKeys = [\"missing\"]",
+                "unknown Key.ID",
+            ),
+            (
+                "[[Keyring]]\nID = \"fw\"\nKeys = [\"test-key\", \"test-key\"]",
+                "more than once",
+            ),
+            (
+                "[[Keyring]]\nID = \"fw\"\nKeys = [\"test-key\"]\n[[Keyring]]\nID = \"fw\"\nKeys = [\"test-key\"]",
+                "duplicate Keyring.ID",
+            ),
+            (
+                "[[Keyring]]\nID = \"fw\"\nKeys = [\"test-key\"]\n[[Keyring]]\nID = \"fw2\"\nKeys = [\"test-key\"]",
+                "more than once",
+            ),
+        ];
+        for (rings, expected) in invalid_cases {
+            let error = validate(&with_rings(rings)).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn per_key_keyring_membership_is_rejected() {
+        let text = account_config().replace(
+            "PEMPath = \"/tmp/test-key.pem\"",
+            "PEMPath = \"/tmp/test-key.pem\"\nKeyring = \"firmware-prod\"",
+        );
+        let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+        assert!(error.contains("Keyring"), "{error}");
     }
 
     #[test]

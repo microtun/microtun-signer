@@ -23,8 +23,10 @@ use ulid::Ulid;
 use crate::{
     auth::{AuthError, AuthPrincipal, AuthSource, Authenticator, OAuthFlowError},
     authorization::Authorizer,
-    config::{KeyState, PolicyAction, valid_key_id},
-    key::{KeyRing, SignError, UnlockError, UnlockOutcome},
+    config::{KeyState, PolicyAction, valid_key_id, valid_keyring_name},
+    key::{
+        KeyStore, KeyringMemberOutcome, KeyringUnlockError, SignError, UnlockError, UnlockOutcome,
+    },
 };
 use zeroize::Zeroizing;
 
@@ -35,14 +37,14 @@ const MAX_DEVICE_EXCHANGE_SOURCES: usize = 4096;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub keys: Arc<KeyRing>,
+    pub keys: Arc<KeyStore>,
     pub auth: Authenticator,
     pub authz: Authorizer,
     device_exchange_limiter: Arc<DeviceExchangeLimiter>,
 }
 
 impl AppState {
-    pub fn new(keys: Arc<KeyRing>, auth: Authenticator, authz: Authorizer) -> Self {
+    pub fn new(keys: Arc<KeyStore>, auth: Authenticator, authz: Authorizer) -> Self {
         Self {
             keys,
             auth,
@@ -111,7 +113,7 @@ impl DeviceExchangeLimiter {
 /// State for the local-only admin API served on the Unix-domain socket.
 #[derive(Clone)]
 pub struct AdminState {
-    pub keys: Arc<KeyRing>,
+    pub keys: Arc<KeyStore>,
     /// Allows one key decryption at a time. Each attempt runs a deliberately
     /// expensive KDF (scrypt may use up to 1 GiB), so concurrent attempts are
     /// queued rather than multiplied.
@@ -119,7 +121,7 @@ pub struct AdminState {
 }
 
 impl AdminState {
-    pub fn new(keys: Arc<KeyRing>) -> Self {
+    pub fn new(keys: Arc<KeyStore>) -> Self {
         Self {
             keys,
             unlock_permits: Arc::new(Semaphore::new(1)),
@@ -320,15 +322,7 @@ pub async fn unlock_key(
 ) -> Result<StatusCode, ApiError> {
     let request_id = Ulid::new().to_string();
 
-    if !is_json_content_type(&headers) {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported-content-type",
-            "Unsupported content type",
-            "Unlock requests must use Content-Type: application/json.",
-            &request_id,
-        ));
-    }
+    require_json_unlock_request(&headers, &request_id)?;
 
     let key = if valid_key_id(&key_id) {
         state.keys.get(&key_id)
@@ -354,25 +348,7 @@ pub async fn unlock_key(
         ));
     };
 
-    let request: UnlockRequest = serde_json::from_slice(&body).map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "malformed-json",
-            "Malformed unlock request",
-            "The request body must contain a JSON string field named passphrase.",
-            &request_id,
-        )
-    })?;
-    if request.passphrase.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "empty-passphrase",
-            "Signing key passphrase is empty",
-            "The unlock passphrase must not be empty.",
-            &request_id,
-        ));
-    }
-    let passphrase = Zeroizing::new(request.passphrase);
+    let passphrase = parse_unlock_request(&body, &request_id)?;
 
     // The KDF takes hundreds of milliseconds to seconds of CPU, so it runs on
     // the blocking pool instead of stalling a runtime worker. The permit is
@@ -455,6 +431,216 @@ pub async fn unlock_key(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn require_json_unlock_request(headers: &HeaderMap, request_id: &str) -> Result<(), ApiError> {
+    if is_json_content_type(headers) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported-content-type",
+        "Unsupported content type",
+        "Unlock requests must use Content-Type: application/json.",
+        request_id,
+    ))
+}
+
+fn parse_unlock_request(body: &[u8], request_id: &str) -> Result<Zeroizing<String>, ApiError> {
+    let request: UnlockRequest = serde_json::from_slice(body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed-json",
+            "Malformed unlock request",
+            "The request body must contain a JSON string field named passphrase.",
+            request_id,
+        )
+    })?;
+    let passphrase = Zeroizing::new(request.passphrase);
+    if passphrase.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "empty-passphrase",
+            "Signing key passphrase is empty",
+            "The unlock passphrase must not be empty.",
+            request_id,
+        ));
+    }
+    Ok(passphrase)
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyringUnlockResponse {
+    pub keyring: String,
+    pub keys: Vec<KeyringUnlockKey>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyringUnlockKey {
+    pub key_id: String,
+    pub result: String,
+}
+
+impl From<&KeyringMemberOutcome> for KeyringUnlockKey {
+    fn from(outcome: &KeyringMemberOutcome) -> Self {
+        Self {
+            key_id: outcome.key_id.clone(),
+            result: outcome.result.as_str().to_owned(),
+        }
+    }
+}
+
+/// Unlock every active key in a configured keyring with one passphrase.
+///
+/// All locked members are decrypted before any of them is unlocked, so a
+/// passphrase that does not open every member leaves the keyring locked.
+pub async fn unlock_keyring(
+    State(state): State<AdminState>,
+    Path(keyring): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<KeyringUnlockResponse>, ApiError> {
+    let request_id = Ulid::new().to_string();
+    require_json_unlock_request(&headers, &request_id)?;
+
+    if !valid_keyring_name(&keyring) || !state.keys.has_keyring(&keyring) {
+        keyring_audit_failure(&request_id, &keyring, "unknown-keyring", &[]);
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown-keyring",
+            "Unknown keyring",
+            "No configured signing key belongs to the requested keyring.",
+            &request_id,
+        ));
+    }
+
+    let passphrase = parse_unlock_request(&body, &request_id)?;
+
+    // Same reasoning as unlock_key: one KDF at a time, off the runtime, with
+    // the permit held until the blocking work really finishes.
+    let permit = state
+        .unlock_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| keyring_unlock_task_failed(&request_id, &keyring))?;
+    let keys = state.keys.clone();
+    let blocking_keyring = keyring.clone();
+    let unlock_result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        keys.unlock_keyring(&blocking_keyring, passphrase.as_str())
+    })
+    .await
+    .map_err(|_| keyring_unlock_task_failed(&request_id, &keyring))?;
+
+    let outcomes = match unlock_result {
+        Ok(outcomes) => outcomes,
+        Err(KeyringUnlockError::UnknownKeyring) => {
+            keyring_audit_failure(&request_id, &keyring, "unknown-keyring", &[]);
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown-keyring",
+                "Unknown keyring",
+                "No configured signing key belongs to the requested keyring.",
+                &request_id,
+            ));
+        }
+        Err(KeyringUnlockError::NoActiveKeys) => {
+            keyring_audit_failure(&request_id, &keyring, "no-active-keys", &[]);
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "keyring-has-no-active-keys",
+                "Keyring has no active keys",
+                "Only active signing keys can be unlocked, and this keyring has none.",
+                &request_id,
+            ));
+        }
+        Err(KeyringUnlockError::InvalidPassphrase) => {
+            keyring_audit_failure(&request_id, &keyring, "invalid-passphrase", &[]);
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "invalid-key-passphrase",
+                "Keyring unlock failed",
+                "The supplied passphrase did not unlock any key in the keyring.",
+                &request_id,
+            ));
+        }
+        Err(KeyringUnlockError::PassphraseMismatch { failed, .. }) => {
+            keyring_audit_failure(
+                &request_id,
+                &keyring,
+                "keyring-passphrase-mismatch",
+                &failed,
+            );
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "keyring-passphrase-mismatch",
+                "Keyring passphrase mismatch",
+                "The passphrase unlocked some keys in the keyring but not others, so none were unlocked.",
+                &request_id,
+            )
+            .with_keys(failed));
+        }
+        Err(KeyringUnlockError::LockPoisoned) => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "key-lock-failure",
+                "Signing key lock failed",
+                "The keyring could not be unlocked due to an internal state error.",
+                &request_id,
+            ));
+        }
+    };
+
+    for outcome in &outcomes {
+        tracing::info!(
+            target: "microtun_signer::audit",
+            request_id = %request_id,
+            operation = "unlock-keyring",
+            success = true,
+            reason = outcome.result.as_str(),
+            keyring = %keyring,
+            key_id = %outcome.key_id,
+            "microtun signer unlock audit event"
+        );
+    }
+
+    Ok(Json(KeyringUnlockResponse {
+        keys: outcomes.iter().map(KeyringUnlockKey::from).collect(),
+        keyring,
+    }))
+}
+
+fn keyring_audit_failure(request_id: &str, keyring: &str, reason: &str, failed_keys: &[String]) {
+    tracing::warn!(
+        target: "microtun_signer::audit",
+        request_id = %request_id,
+        operation = "unlock-keyring",
+        success = false,
+        reason = reason,
+        keyring = %keyring,
+        failed_key_ids = ?failed_keys,
+        "microtun signer unlock audit event"
+    );
+}
+
+fn keyring_unlock_task_failed(request_id: &str, keyring: &str) -> ApiError {
+    tracing::error!(
+        target: "microtun_signer::audit",
+        request_id = %request_id,
+        operation = "unlock-keyring",
+        success = false,
+        reason = "unlock-task-failed",
+        keyring = %keyring,
+        "microtun signer unlock audit event"
+    );
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "key-unlock-failure",
+        "Keyring unlock failed",
+        "The keyring could not be unlocked due to an internal error.",
+        request_id,
+    )
 }
 
 fn unlock_task_failed(request_id: &str, key_id: &str) -> ApiError {
@@ -972,6 +1158,9 @@ async fn audit_best_effort(_state: &AppState, record: AuditRecord) {
 struct ErrorBody {
     error: &'static str,
     request_id: String,
+    /// Signing keys the error applies to, when it concerns specific keys.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    keys: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -980,6 +1169,7 @@ pub struct ApiError {
     slug: &'static str,
     request_id: String,
     authenticate: bool,
+    keys: Vec<String>,
 }
 
 impl ApiError {
@@ -995,7 +1185,13 @@ impl ApiError {
             slug,
             request_id: request_id.to_owned(),
             authenticate: false,
+            keys: Vec::new(),
         }
+    }
+
+    fn with_keys(mut self, keys: Vec<String>) -> Self {
+        self.keys = keys;
+        self
     }
 
     fn without_request_id(
@@ -1029,6 +1225,7 @@ impl IntoResponse for ApiError {
         let body = ErrorBody {
             error: self.slug,
             request_id: self.request_id,
+            keys: self.keys,
         };
         let mut response = (self.status, Json(body)).into_response();
         if self.authenticate {
@@ -1170,7 +1367,7 @@ mod tests {
     }
 
     fn admin_state() -> AdminState {
-        let keys = KeyRing::from_keys_for_tests(vec![
+        let keys = KeyStore::from_keys_for_tests(vec![
             crate::key::KeyMaterial::from_pem_with_algorithm_for_tests(
                 "prod",
                 crate::config::KeyAlgorithm::P256,
@@ -1233,5 +1430,83 @@ mod tests {
         assert!(!state.keys.get("prod").unwrap().is_unlocked());
         // The permit was released, so a later attempt can proceed.
         assert_eq!(state.unlock_permits.available_permits(), 1);
+    }
+
+    fn keyring_admin_state(second_pem: &str) -> AdminState {
+        use crate::{config::KeyAlgorithm, key::KeyMaterial};
+        let keys = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                KeyMaterial::from_pem_with_algorithm_for_tests(
+                    "fw-a",
+                    KeyAlgorithm::P256,
+                    include_str!("../tests/fixtures/test-p256-scrypt.pem"),
+                ),
+                KeyMaterial::from_pem_with_algorithm_for_tests(
+                    "fw-b",
+                    KeyAlgorithm::P256,
+                    second_pem,
+                ),
+            ],
+            &[crate::config::KeyringConfig {
+                id: "fw".into(),
+                keys: vec!["fw-a".into(), "fw-b".into()],
+            }],
+        );
+        AdminState::new(Arc::new(keys))
+    }
+
+    #[tokio::test]
+    async fn keyring_unlock_reports_each_key() {
+        let state =
+            keyring_admin_state(include_str!("../tests/fixtures/test-p256-pbkdf2-600k.pem"));
+        let (headers, body) = unlock_request("test-passphrase");
+        let Json(response) = unlock_keyring(State(state.clone()), Path("fw".into()), headers, body)
+            .await
+            .unwrap();
+        assert_eq!(response.keyring, "fw");
+        let keys: Vec<_> = response
+            .keys
+            .iter()
+            .map(|k| (k.key_id.as_str(), k.result.as_str()))
+            .collect();
+        assert_eq!(keys, [("fw-a", "unlocked"), ("fw-b", "unlocked")]);
+        assert!(state.keys.iter().all(|key| key.is_unlocked()));
+        assert_eq!(state.unlock_permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn keyring_mismatch_names_failed_keys_and_unlocks_nothing() {
+        // fw-b is a secp256k1 key configured as p256, so the shared
+        // passphrase cannot open it.
+        let state =
+            keyring_admin_state(include_str!("../tests/fixtures/test-secp256k1-scrypt.pem"));
+        let (headers, body) = unlock_request("test-passphrase");
+        let error = unlock_keyring(State(state.clone()), Path("fw".into()), headers, body)
+            .await
+            .unwrap_err();
+        assert_eq!(error.slug, "keyring-passphrase-mismatch");
+        assert_eq!(error.keys, ["fw-b"]);
+        assert!(state.keys.iter().all(|key| !key.is_unlocked()));
+
+        let response = error.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["keys"], serde_json::json!(["fw-b"]));
+    }
+
+    #[tokio::test]
+    async fn unknown_keyring_is_rejected_before_reading_the_passphrase() {
+        let state =
+            keyring_admin_state(include_str!("../tests/fixtures/test-p256-pbkdf2-600k.pem"));
+        for name in ["missing", "bad/name", "fw-a"] {
+            let (headers, body) = unlock_request("test-passphrase");
+            let error = unlock_keyring(State(state.clone()), Path(name.into()), headers, body)
+                .await
+                .unwrap_err();
+            assert_eq!(error.slug, "unknown-keyring", "{name}");
+        }
+        assert!(state.keys.iter().all(|key| !key.is_unlocked()));
     }
 }

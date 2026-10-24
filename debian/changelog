@@ -1,8 +1,14 @@
-microtun-signer (0.10.1) UNRELEASED; urgency=medium
+microtun-signer (0.11.0) UNRELEASED; urgency=medium
+
+  * Add keyring support 
+
+ -- Damian Peckett <damian@pecke.tt>  Sat, 24 Oct 2026 16:55:53 +0200
+
+microtun-signer (0.10.1) unstable; urgency=medium
 
   * Support more ENV vars 
 
- -- Damian Peckett <damian@pecke.tt>  Sat, 24 Oct 2026 13:21:44 +0200
+ -- Damian Peckett <damian@pecke.tt>  Sat, 24 Oct 2026 16:55:42 +0200
 
 microtun-signer (0.10.0) unstable; urgency=medium
 

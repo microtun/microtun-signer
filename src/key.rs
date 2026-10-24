@@ -16,46 +16,232 @@ use rsa::{
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::config::{KeyAlgorithm, KeyConfig, KeyState};
+use crate::config::{KeyAlgorithm, KeyConfig, KeyState, KeyringConfig};
 
-pub struct KeyRing {
-    keys: HashMap<String, KeyMaterial>,
+/// All configured signing keys, in configuration order.
+pub struct KeyStore {
+    keys: Vec<KeyMaterial>,
+    index: HashMap<String, usize>,
+    /// Membership is defined by [[Keyring]], in the order of its Keys list.
+    keyrings: HashMap<String, Vec<usize>>,
+    keyring_by_key: HashMap<String, String>,
 }
 
-impl KeyRing {
-    pub fn load(configs: &[KeyConfig]) -> Result<Self> {
-        let mut keys = HashMap::with_capacity(configs.len());
-        for config in configs {
-            let key = KeyMaterial::load(config)
-                .with_context(|| format!("failed to load signing key {}", config.id))?;
-            if keys.insert(config.id.clone(), key).is_some() {
-                bail!("duplicate signing key id {}", config.id);
-            }
-        }
+impl KeyStore {
+    pub fn load(configs: &[KeyConfig], keyrings: &[KeyringConfig]) -> Result<Self> {
+        let keys = configs
+            .iter()
+            .map(|config| {
+                KeyMaterial::load(config)
+                    .with_context(|| format!("failed to load signing key {}", config.id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_keys(keys, keyrings)
+    }
+
+    fn from_keys(keys: Vec<KeyMaterial>, keyrings: &[KeyringConfig]) -> Result<Self> {
         if keys.is_empty() {
             bail!("at least one signing key is required");
         }
-        Ok(Self { keys })
+        let mut index = HashMap::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            if index.insert(key.id.clone(), position).is_some() {
+                bail!("duplicate signing key id {}", key.id);
+            }
+        }
+
+        let mut ring_index = HashMap::with_capacity(keyrings.len());
+        let mut keyring_by_key = HashMap::new();
+        for keyring in keyrings {
+            if keyring.keys.is_empty() {
+                bail!("keyring {} must contain at least one key", keyring.id);
+            }
+            let mut members = Vec::with_capacity(keyring.keys.len());
+            for key_id in &keyring.keys {
+                let &position = index.get(key_id).ok_or_else(|| {
+                    anyhow::anyhow!("keyring {} references unknown key {}", keyring.id, key_id)
+                })?;
+                if let Some(previous) = keyring_by_key.insert(key_id.clone(), keyring.id.clone()) {
+                    bail!(
+                        "key {} belongs to multiple keyrings ({} and {})",
+                        key_id,
+                        previous,
+                        keyring.id
+                    );
+                }
+                members.push(position);
+            }
+            if ring_index.insert(keyring.id.clone(), members).is_some() {
+                bail!("duplicate keyring id {}", keyring.id);
+            }
+        }
+        Ok(Self {
+            keys,
+            index,
+            keyrings: ring_index,
+            keyring_by_key,
+        })
     }
 
     pub fn get(&self, id: &str) -> Option<&KeyMaterial> {
-        self.keys.get(id)
+        self.index.get(id).map(|&position| &self.keys[position])
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &KeyMaterial> {
-        self.keys.values()
+        self.keys.iter()
     }
 
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
+    /// Keys that belong to the named keyring, in its declared Keys order.
+    pub fn keyring_members(&self, name: &str) -> impl Iterator<Item = &KeyMaterial> + '_ {
+        self.keyrings
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&position| &self.keys[position])
+    }
+
+    pub fn has_keyring(&self, name: &str) -> bool {
+        self.keyrings.contains_key(name)
+    }
+
+    pub fn keyring_for_key(&self, key_id: &str) -> Option<&str> {
+        self.keyring_by_key.get(key_id).map(String::as_str)
+    }
+
+    /// Unlock every active key in a keyring with one passphrase.
+    ///
+    /// This is all-or-nothing: every locked, active member is decrypted
+    /// first, and the decrypted keys are only installed if all of them
+    /// succeeded. Members that are already unlocked are left alone and
+    /// inactive members are skipped. Each attempt runs the key's KDF, so
+    /// callers must run this off the async runtime.
+    pub fn unlock_keyring(
+        &self,
+        name: &str,
+        passphrase: &str,
+    ) -> Result<Vec<KeyringMemberOutcome>, KeyringUnlockError> {
+        let members: Vec<&KeyMaterial> = self.keyring_members(name).collect();
+        if members.is_empty() {
+            return Err(KeyringUnlockError::UnknownKeyring);
+        }
+        if members.iter().all(|key| key.state != KeyState::Active) {
+            return Err(KeyringUnlockError::NoActiveKeys);
+        }
+
+        let mut outcomes = Vec::with_capacity(members.len());
+        let mut decrypted = Vec::new();
+        let mut opened = Vec::new();
+        let mut failed = Vec::new();
+        for key in members {
+            let result = if key.state != KeyState::Active {
+                KeyringMemberResult::SkippedInactive
+            } else if key.is_unlocked() {
+                KeyringMemberResult::AlreadyUnlocked
+            } else {
+                match key.decrypt(passphrase) {
+                    Ok(material) => {
+                        opened.push(key.id.clone());
+                        decrypted.push((key, material));
+                    }
+                    Err(_) => failed.push(key.id.clone()),
+                }
+                KeyringMemberResult::Unlocked
+            };
+            outcomes.push(KeyringMemberOutcome {
+                key_id: key.id.clone(),
+                result,
+            });
+        }
+
+        if !failed.is_empty() {
+            // Dropping `decrypted` zeroizes the keys that did open.
+            return Err(if opened.is_empty() {
+                KeyringUnlockError::InvalidPassphrase
+            } else {
+                KeyringUnlockError::PassphraseMismatch { opened, failed }
+            });
+        }
+
+        // Take every write lock before installing anything, so a poisoned
+        // lock cannot leave the keyring partially unlocked.
+        let guards = decrypted
+            .into_iter()
+            .map(|(key, material)| {
+                key.unlocked
+                    .write()
+                    .map(|guard| (key.id.as_str(), guard, material))
+                    .map_err(|_| KeyringUnlockError::LockPoisoned)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (key_id, mut guard, material) in guards {
+            if guard.is_some() {
+                // Unlocked concurrently since the check above; keep that one.
+                if let Some(outcome) = outcomes.iter_mut().find(|o| o.key_id == key_id) {
+                    outcome.result = KeyringMemberResult::AlreadyUnlocked;
+                }
+            } else {
+                *guard = Some(material);
+            }
+        }
+        Ok(outcomes)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_keys_for_tests(keys: Vec<KeyMaterial>) -> Self {
-        Self {
-            keys: keys.into_iter().map(|key| (key.id.clone(), key)).collect(),
+        Self::from_keys(keys, &[]).expect("valid test keys")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_keys_with_keyrings_for_tests(
+        keys: Vec<KeyMaterial>,
+        keyrings: &[KeyringConfig],
+    ) -> Self {
+        Self::from_keys(keys, keyrings).expect("valid test keys and keyrings")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyringMemberOutcome {
+    pub key_id: String,
+    pub result: KeyringMemberResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyringMemberResult {
+    Unlocked,
+    AlreadyUnlocked,
+    SkippedInactive,
+}
+
+impl KeyringMemberResult {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unlocked => "unlocked",
+            Self::AlreadyUnlocked => "already-unlocked",
+            Self::SkippedInactive => "skipped-inactive",
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KeyringUnlockError {
+    #[error("no signing keys belong to this keyring")]
+    UnknownKeyring,
+    #[error("the keyring has no active signing keys")]
+    NoActiveKeys,
+    #[error("the passphrase did not unlock any key in the keyring")]
+    InvalidPassphrase,
+    #[error("the passphrase unlocked some keys in the keyring but not others")]
+    PassphraseMismatch {
+        opened: Vec<String>,
+        failed: Vec<String>,
+    },
+    #[error("signing key lock is poisoned")]
+    LockPoisoned,
 }
 
 pub struct KeyMaterial {
@@ -144,6 +330,12 @@ impl KeyMaterial {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_state_for_tests(mut self, state: KeyState) -> Self {
+        self.state = state;
+        self
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -200,28 +392,29 @@ impl KeyMaterial {
             }
         }
 
-        let unlocked = match self.algorithm {
-            KeyAlgorithm::P256 => P256SigningKey::from_pkcs8_encrypted_pem(
-                self.encrypted_pem.as_str(),
-                passphrase.as_bytes(),
-            )
-            .map(UnlockedKeyMaterial::P256)
-            .map_err(|_| UnlockError::InvalidPassphrase)?,
-            KeyAlgorithm::Secp256k1 => Secp256k1SigningKey::from_pkcs8_encrypted_pem(
-                self.encrypted_pem.as_str(),
-                passphrase.as_bytes(),
-            )
-            .map(UnlockedKeyMaterial::Secp256k1)
-            .map_err(|_| UnlockError::InvalidPassphrase)?,
-            KeyAlgorithm::RsaPss => RsaPrivateKey::from_pkcs8_encrypted_pem(
-                self.encrypted_pem.as_str(),
-                passphrase.as_bytes(),
-            )
-            .map(RsaPssSigningKey::<Sha256>::new)
-            .map(UnlockedKeyMaterial::RsaPss)
-            .map_err(|_| UnlockError::InvalidPassphrase)?,
-        };
+        let unlocked = self.decrypt(passphrase)?;
+        self.install(unlocked)
+    }
 
+    /// Run the KDF and decrypt the key without changing its lock state.
+    fn decrypt(&self, passphrase: &str) -> Result<UnlockedKeyMaterial, UnlockError> {
+        let pem = self.encrypted_pem.as_str();
+        let passphrase = passphrase.as_bytes();
+        match self.algorithm {
+            KeyAlgorithm::P256 => P256SigningKey::from_pkcs8_encrypted_pem(pem, passphrase)
+                .map(UnlockedKeyMaterial::P256),
+            KeyAlgorithm::Secp256k1 => {
+                Secp256k1SigningKey::from_pkcs8_encrypted_pem(pem, passphrase)
+                    .map(UnlockedKeyMaterial::Secp256k1)
+            }
+            KeyAlgorithm::RsaPss => RsaPrivateKey::from_pkcs8_encrypted_pem(pem, passphrase)
+                .map(RsaPssSigningKey::<Sha256>::new)
+                .map(UnlockedKeyMaterial::RsaPss),
+        }
+        .map_err(|_| UnlockError::InvalidPassphrase)
+    }
+
+    fn install(&self, unlocked: UnlockedKeyMaterial) -> Result<UnlockOutcome, UnlockError> {
         let mut guard = self
             .unlocked
             .write()
@@ -749,17 +942,212 @@ mod tests {
     }
 
     #[test]
-    fn key_ring_selects_keys_by_immutable_id() {
-        let ring = KeyRing {
-            keys: HashMap::from([
-                ("key-a".to_owned(), test_key("key-a", KeyState::Active)),
-                ("key-b".to_owned(), test_key("key-b", KeyState::Retired)),
-            ]),
-        };
+    fn key_store_selects_keys_by_immutable_id() {
+        let store = KeyStore::from_keys_for_tests(vec![
+            test_key("key-a", KeyState::Active),
+            test_key("key-b", KeyState::Retired),
+        ]);
 
-        assert_eq!(ring.len(), 2);
-        assert_eq!(ring.get("key-a").unwrap().state(), KeyState::Active);
-        assert_eq!(ring.get("key-b").unwrap().state(), KeyState::Retired);
-        assert!(ring.get("missing").is_none());
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get("key-a").unwrap().state(), KeyState::Active);
+        assert_eq!(store.get("key-b").unwrap().state(), KeyState::Retired);
+        assert!(store.get("missing").is_none());
+        let ids: Vec<_> = store.iter().map(KeyMaterial::id).collect();
+        assert_eq!(ids, ["key-a", "key-b"]);
+    }
+
+    #[test]
+    fn key_store_rejects_duplicate_ids() {
+        assert!(
+            KeyStore::from_keys(
+                vec![
+                    test_key("same", KeyState::Active),
+                    test_key("same", KeyState::Active),
+                ],
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    fn fixture(id: &str, algorithm: KeyAlgorithm, pem: &str) -> KeyMaterial {
+        KeyMaterial::from_pem_with_algorithm_for_tests(id, algorithm, pem)
+    }
+
+    fn keyring(id: &str, keys: &[&str]) -> KeyringConfig {
+        KeyringConfig {
+            id: id.to_owned(),
+            keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+        }
+    }
+
+    const P256_PEM: &str = include_str!("../tests/fixtures/test-p256-scrypt.pem");
+    const SECP256K1_PEM: &str = include_str!("../tests/fixtures/test-secp256k1-scrypt.pem");
+    const RSA_PEM: &str = include_str!("../tests/fixtures/test-rsa-pss-scrypt.pem");
+
+    #[test]
+    fn keyring_membership_and_order_are_defined_by_keyring_keys() {
+        let store = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                test_key("a", KeyState::Active),
+                test_key("b", KeyState::Active),
+                test_key("ungrouped", KeyState::Active),
+            ],
+            &[keyring("fw", &["b", "a"])],
+        );
+        let members: Vec<_> = store.keyring_members("fw").map(KeyMaterial::id).collect();
+        assert_eq!(members, ["b", "a"]);
+        assert!(store.has_keyring("fw"));
+        assert!(!store.has_keyring("missing"));
+        assert_eq!(store.keyring_for_key("a"), Some("fw"));
+        assert_eq!(store.keyring_for_key("b"), Some("fw"));
+        assert_eq!(store.keyring_for_key("ungrouped"), None);
+    }
+
+    #[test]
+    fn key_store_rejects_invalid_keyring_membership() {
+        for keyrings in [
+            vec![keyring("fw", &[])],
+            vec![keyring("fw", &["missing"])],
+            vec![keyring("fw", &["a", "a"])],
+            vec![keyring("fw", &["a"]), keyring("other", &["a"])],
+            vec![keyring("fw", &["a"]), keyring("fw", &["b"])],
+        ] {
+            assert!(
+                KeyStore::from_keys(
+                    vec![
+                        test_key("a", KeyState::Active),
+                        test_key("b", KeyState::Active),
+                    ],
+                    &keyrings,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn keyring_unlocks_every_member_with_one_passphrase() {
+        let store = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                fixture("p256", KeyAlgorithm::P256, P256_PEM),
+                fixture("outside", KeyAlgorithm::P256, P256_PEM),
+                fixture("k1", KeyAlgorithm::Secp256k1, SECP256K1_PEM),
+                fixture("rsa", KeyAlgorithm::RsaPss, RSA_PEM),
+            ],
+            &[
+                keyring("fw", &["p256", "k1", "rsa"]),
+                keyring("other", &["outside"]),
+            ],
+        );
+        assert!(store.has_keyring("fw"));
+
+        let outcomes = store.unlock_keyring("fw", "test-passphrase").unwrap();
+        let summary: Vec<_> = outcomes
+            .iter()
+            .map(|o| (o.key_id.as_str(), o.result))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("p256", KeyringMemberResult::Unlocked),
+                ("k1", KeyringMemberResult::Unlocked),
+                ("rsa", KeyringMemberResult::Unlocked),
+            ]
+        );
+        for id in ["p256", "k1", "rsa"] {
+            let key = store.get(id).unwrap();
+            assert!(key.is_unlocked(), "{id}");
+            assert!(key.sign_digest(&[7; 32]).is_ok(), "{id}");
+        }
+        assert!(!store.get("outside").unwrap().is_unlocked());
+    }
+
+    #[test]
+    fn keyring_unlock_is_all_or_nothing() {
+        // The second key is misconfigured, so the shared passphrase cannot
+        // open it. Nothing in the keyring may be unlocked as a result.
+        let store = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                fixture("good", KeyAlgorithm::P256, P256_PEM),
+                fixture("bad", KeyAlgorithm::P256, SECP256K1_PEM),
+            ],
+            &[keyring("fw", &["good", "bad"])],
+        );
+        match store.unlock_keyring("fw", "test-passphrase") {
+            Err(KeyringUnlockError::PassphraseMismatch { opened, failed }) => {
+                assert_eq!(opened, ["good"]);
+                assert_eq!(failed, ["bad"]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(!store.get("good").unwrap().is_unlocked());
+        assert!(!store.get("bad").unwrap().is_unlocked());
+    }
+
+    #[test]
+    fn keyring_wrong_passphrase_unlocks_nothing() {
+        let store = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                fixture("a", KeyAlgorithm::P256, P256_PEM),
+                fixture("b", KeyAlgorithm::Secp256k1, SECP256K1_PEM),
+            ],
+            &[keyring("fw", &["a", "b"])],
+        );
+        assert!(matches!(
+            store.unlock_keyring("fw", "wrong"),
+            Err(KeyringUnlockError::InvalidPassphrase)
+        ));
+        assert!(store.iter().all(|key| !key.is_unlocked()));
+    }
+
+    #[test]
+    fn keyring_skips_inactive_and_already_unlocked_members() {
+        let store = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                fixture("unlocked", KeyAlgorithm::P256, P256_PEM),
+                fixture("retired", KeyAlgorithm::P256, P256_PEM)
+                    .with_state_for_tests(KeyState::Retired),
+                fixture("locked", KeyAlgorithm::Secp256k1, SECP256K1_PEM),
+            ],
+            &[keyring("fw", &["unlocked", "retired", "locked"])],
+        );
+        store
+            .get("unlocked")
+            .unwrap()
+            .unlock("test-passphrase")
+            .unwrap();
+
+        let outcomes = store.unlock_keyring("fw", "test-passphrase").unwrap();
+        let results: Vec<_> = outcomes.iter().map(|o| o.result).collect();
+        assert_eq!(
+            results,
+            [
+                KeyringMemberResult::AlreadyUnlocked,
+                KeyringMemberResult::SkippedInactive,
+                KeyringMemberResult::Unlocked,
+            ]
+        );
+        assert!(!store.get("retired").unwrap().is_unlocked());
+    }
+
+    #[test]
+    fn keyring_errors_for_unknown_or_inactive_keyrings() {
+        let store = KeyStore::from_keys_with_keyrings_for_tests(
+            vec![
+                fixture("retired", KeyAlgorithm::P256, P256_PEM)
+                    .with_state_for_tests(KeyState::Retired),
+            ],
+            &[keyring("old", &["retired"])],
+        );
+        assert!(!store.has_keyring("missing"));
+        assert!(matches!(
+            store.unlock_keyring("missing", "test-passphrase"),
+            Err(KeyringUnlockError::UnknownKeyring)
+        ));
+        assert!(matches!(
+            store.unlock_keyring("old", "test-passphrase"),
+            Err(KeyringUnlockError::NoActiveKeys)
+        ));
     }
 }
