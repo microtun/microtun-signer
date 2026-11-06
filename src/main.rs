@@ -67,7 +67,7 @@ enum Commands {
     /// Interactively unlock an active signing key, or every key in a keyring.
     Unlock(UnlockArgs),
 
-    /// Sign a 32-byte MCUboot SHA-256 firmware digest.
+    /// Sign a 32-byte SHA-256 firmware digest.
     Sign(client::SignArgs),
 
     /// Get the PEM-encoded public key for a signing key.

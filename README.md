@@ -1,6 +1,6 @@
 # microtun-signer
 
-A small Rust service that signs MCUboot firmware digests.
+A small Rust service that signs firmware digests.
 
 It supports:
 
@@ -12,7 +12,7 @@ It supports:
 
 - P-256 (secp256r1 / prime256v1)
 - secp256k1 (RPI Pico 2)
-- RSA-PSS (Espressif ESP32)
+- RSA-PSS (Espressif ESP32 SBV2)
 
 ## Build
 

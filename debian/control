@@ -17,5 +17,5 @@ Depends:
  adduser,
  systemd
 Description: Microtun firmware signing service
- A small Rust service for signing MCUboot SHA-256 firmware digests with 
+ A small Rust service for signing SHA-256 firmware digests with 
  encrypted P-256, secp256k1, or RSA-PSS keys.

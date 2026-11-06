@@ -42,7 +42,7 @@ pub struct SignArgs {
     #[arg(long, env = "MICROTUN_SIGNER_AUDIENCE")]
     audience: Option<String>,
 
-    /// 32-byte MCUboot SHA-256 digest encoded as base64.
+    /// 32-byte SHA-256 firmware digest encoded as base64.
     #[arg(short = 'd', long, env = "MICROTUN_SIGNER_DIGEST")]
     digest: String,
 }
