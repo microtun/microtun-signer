@@ -4,7 +4,7 @@ A small Rust service that signs firmware digests.
 
 It supports:
 
-- GitHub users via OAuth device flow
+- GitHub users via the OAuth authorization code flow (browser sign-in, PKCE, refresh tokens)
 - GitHub Actions via OIDC
 - Signing keys are encrypted at rest and must be unlocked after every restart
 
@@ -70,6 +70,11 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 | \
 The GitHub OAuth client secret is read from a systemd credential via
 `$CREDENTIALS_DIRECTORY/<credential-name>`; it is not stored in `config.toml`.
 
+`[Server] PublicURL` must be the URL users reach the signer at, and the GitHub
+OAuth App's **Authorization callback URL** must be set to
+`<PublicURL>/v1/auth/github/callback`. Device Flow does not need to be enabled
+on the OAuth App.
+
 For local development, you can point `CREDENTIALS_DIRECTORY` at a private directory containing the secret.
 
 The public listener is plain HTTP. Use a trusted TLS reverse proxy for non-loopback deployments.
@@ -131,6 +136,45 @@ in a keyring can still be unlocked with `--key-id`.
   --github-login \
   --key-id microtun-firmware-prod \
   --digest "$DIGEST_BASE64"
+```
+
+The first run prints a sign-in URL and opens it in your browser (pass
+`--no-browser` to only print it). After you sign in with GitHub, the browser is
+redirected to a temporary listener the CLI opened on `127.0.0.1`, and the
+command continues. The browser therefore has to run on the same machine as the
+CLI.
+
+How it works:
+
+- The signer is a small OAuth 2.0 authorization server for the CLI. The CLI
+  runs the authorization code flow with PKCE against it, using a loopback
+  redirect URI ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252)).
+- The signer sends the browser on to GitHub, exchanges GitHub's code itself
+  with the client secret, checks that the account is a configured identity
+  with two-factor authentication enabled, and revokes the GitHub token again.
+  GitHub credentials never reach the CLI.
+- The CLI receives a short-lived access token (`OAuthSessionTTLSeconds`,
+  default 15 minutes) and a refresh token, and caches both (see below). Later
+  runs reuse the access token, or silently trade the
+  refresh token for a new pair, until `OAuthRefreshTTLSeconds` (default 8
+  hours, `0` to disable refresh tokens) has passed since the GitHub sign-in.
+  Then the browser is needed again.
+- Refresh tokens are single-use and rotate on every refresh. Presenting an
+  already-used refresh token revokes that whole login. Refreshing does not go
+  back to GitHub, so a change to the account (for example 2FA being turned
+  off) takes effect at the next browser sign-in.
+
+The cached session is kept in the operating system's credential store:
+Keychain on macOS, and the Secret Service (GNOME Keyring, KWallet, ...) on
+Linux. Where there is none, typically on a headless machine, it falls back to
+a file readable only by you under `$XDG_RUNTIME_DIR` (or the user cache
+directory). Set `MICROTUN_SIGNER_SESSION_CACHE_DIR` to an absolute path to use
+a file in that directory instead of the credential store.
+
+End the session early, on the signer and locally, with:
+
+```bash
+./target/release/microtun-signer logout --url https://signer.example.com/
 ```
 
 ### GitHub Actions
@@ -203,8 +247,10 @@ On success, the command writes the PEM-encoded SubjectPublicKeyInfo public key t
 ```text
 GET  /healthz
 GET  /version
-GET  /v1/auth/github/device
-POST /v1/auth/github/device
+GET  /v1/auth/authorize          OAuth 2.0 authorization endpoint (redirects to GitHub)
+GET  /v1/auth/github/callback    GitHub redirects the browser back here
+POST /v1/auth/token              OAuth 2.0 token endpoint (authorization_code, refresh_token)
+POST /v1/auth/revoke             OAuth 2.0 token revocation
 GET  /v1/public-key/{key_id}
 POST /v1/sign/{key_id}
 ```
@@ -245,7 +291,7 @@ cargo test --all-targets --locked
 ## Deployment notes
 
 - Debian/systemd files are in `debian/` and `deploy/`.
-- Restarting the service locks all keys again and invalidates local human sessions.
+- Restarting the service locks all keys again and invalidates all human sessions, including their refresh tokens.
 - GitHub Actions signing policies are configured in `config.toml`; start from `config.example.toml`.
 - Release tags must be `vX.Y.Z` and match both `Cargo.toml` and `debian/changelog`.
 

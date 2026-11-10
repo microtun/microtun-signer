@@ -4,7 +4,10 @@ mod authorization;
 mod client;
 mod config;
 mod key;
+mod oauth;
 mod session_cache;
+#[cfg(test)]
+mod test_github;
 
 use std::{
     fs,
@@ -19,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    http::HeaderName,
     routing::{get, post},
 };
 use clap::{Parser, Subcommand};
@@ -31,10 +35,10 @@ use zeroize::Zeroizing;
 use crate::{
     api::{
         AdminState, AppState, KeyringUnlockResponse, create_signature, get_public_key,
-        github_oauth_device_config, github_oauth_device_exchange, health, unlock_key,
-        unlock_keyring, version,
+        github_oauth_callback, health, oauth_authorize, oauth_revoke, oauth_token,
+        rate_limit_logins, unlock_key, unlock_keyring, version,
     },
-    auth::Authenticator,
+    auth::{Authenticator, GITHUB_CALLBACK_PATH},
     authorization::Authorizer,
     config::{Config, DEFAULT_ADMIN_SOCKET_PATH, valid_keyring_name},
     key::KeyStore,
@@ -72,6 +76,9 @@ enum Commands {
 
     /// Get the PEM-encoded public key for a signing key.
     PublicKey(client::PublicKeyArgs),
+
+    /// End the cached GitHub user session for a signer and forget it locally.
+    Logout,
 }
 
 #[derive(Debug, clap::Args)]
@@ -132,6 +139,10 @@ async fn main() -> Result<()> {
             let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
             client::public_key(&url, args).await
         }
+        Commands::Logout => {
+            let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
+            client::logout(&url).await
+        }
     }
 }
 
@@ -156,6 +167,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
     );
 
     let authenticator = Authenticator::new(
+        &config.server.public_url,
         config.github.clone(),
         config.github_actions.clone(),
         config.identities.clone(),
@@ -165,19 +177,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     let state = AppState::new(keys.clone(), authenticator, authorizer);
 
-    let app = Router::new()
-        .route("/healthz", get(health))
-        .route("/version", get(version))
-        .route(
-            "/v1/auth/github/device",
-            get(github_oauth_device_config).post(github_oauth_device_exchange),
-        )
-        .route("/v1/public-key/{key_id}", get(get_public_key))
-        .route("/v1/sign/{key_id}", post(create_signature))
-        .layer(DefaultBodyLimit::max(16 * 1024))
-        .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = public_router(state, config.server.client_ip_header_name());
 
     // The admin API deliberately lives on a separate Unix-domain socket. It
     // must never be added to the public TCP router or reverse-proxied.
@@ -207,6 +207,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     tracing::info!(
         listen = %config.server.listen,
+        public_url = %config.server.public_url,
         "microtun signer service started"
     );
     tracing::info!(
@@ -232,6 +233,31 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 
     tokio::try_join!(public_server, admin_server).context("HTTP server failed")?;
     Ok(())
+}
+
+/// The public API. `/v1/auth/*` is a small OAuth 2.0 authorization server for
+/// the CLI that delegates the actual user authentication to GitHub.
+fn public_router(state: AppState, client_ip_header: Option<HeaderName>) -> Router {
+    // The two routes a browser passes through during a login are the only
+    // unauthenticated ones that make the signer hold state or call GitHub.
+    let login_routes = rate_limit_logins(
+        Router::new()
+            .route("/v1/auth/authorize", get(oauth_authorize))
+            .route(GITHUB_CALLBACK_PATH, get(github_oauth_callback)),
+        client_ip_header,
+    );
+    Router::new()
+        .route("/healthz", get(health))
+        .route("/version", get(version))
+        .merge(login_routes)
+        .route("/v1/auth/token", post(oauth_token))
+        .route("/v1/auth/revoke", post(oauth_revoke))
+        .route("/v1/public-key/{key_id}", get(get_public_key))
+        .route("/v1/sign/{key_id}", post(create_signature))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(CatchPanicLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 /// Resolve the admin socket for a client subcommand: an explicit --socket,

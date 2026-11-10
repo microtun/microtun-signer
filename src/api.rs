@@ -1,23 +1,28 @@
 use std::{
-    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum::{
-    Json,
-    body::Bytes,
-    extract::{ConnectInfo, Path, State},
+    Form, Json, Router,
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Path, Query, State, rejection::FormRejection},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA, WWW_AUTHENTICATE},
+        HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
+        header::{
+            CACHE_CONTROL, CONTENT_TYPE, LOCATION, PRAGMA, REFERRER_POLICY, RETRY_AFTER,
+            WWW_AUTHENTICATE,
+        },
     },
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
+use tower_governor::{
+    GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
+};
 use ulid::Ulid;
 
 use crate::{
@@ -27,20 +32,24 @@ use crate::{
     key::{
         KeyStore, KeyringMemberOutcome, KeyringUnlockError, SignError, UnlockError, UnlockOutcome,
     },
+    oauth::{Account, AuthorizationRequest, CLI_CLIENT_ID, GrantError},
 };
 use zeroize::Zeroizing;
 
-const DEVICE_EXCHANGE_MAX_CONCURRENT: usize = 8;
-const DEVICE_EXCHANGE_RATE_LIMIT: usize = 10;
-const DEVICE_EXCHANGE_RATE_WINDOW: Duration = Duration::from_secs(60);
-const MAX_DEVICE_EXCHANGE_SOURCES: usize = 4096;
+/// Rate limit on the browser-facing login endpoints, per client address: a
+/// burst of this many requests, replenished one at a time. A login passes
+/// through two of them (authorize, then the GitHub callback).
+const LOGIN_BURST: u32 = 30;
+const LOGIN_REPLENISH_INTERVAL: Duration = Duration::from_secs(2);
+/// GitHub callbacks handled at once; each one makes the signer call GitHub.
+const LOGIN_MAX_CONCURRENT: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
     pub keys: Arc<KeyStore>,
     pub auth: Authenticator,
     pub authz: Authorizer,
-    device_exchange_limiter: Arc<DeviceExchangeLimiter>,
+    login_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -49,64 +58,106 @@ impl AppState {
             keys,
             auth,
             authz,
-            device_exchange_limiter: Arc::new(DeviceExchangeLimiter::new()),
+            login_permits: Arc::new(Semaphore::new(LOGIN_MAX_CONCURRENT)),
         }
     }
 }
 
-struct DeviceExchangeLimiter {
-    permits: Arc<Semaphore>,
-    attempts: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+/// Rate-limiting key: the address of the client as far as it can be trusted.
+///
+/// Without `Server.ClientIPHeader` that is the TCP peer, which behind a
+/// reverse proxy is the proxy for everyone. With it, it is the last address
+/// in that header, i.e. the one the directly connected proxy wrote. Earlier
+/// entries are whatever the client chose to send and are ignored.
+#[derive(Clone)]
+struct ClientIpKeyExtractor {
+    header: Option<HeaderName>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceExchangeLimitError {
-    RateLimited,
-    Busy,
-}
+impl KeyExtractor for ClientIpKeyExtractor {
+    type Key = IpAddr;
 
-impl DeviceExchangeLimiter {
-    fn new() -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(DEVICE_EXCHANGE_MAX_CONCURRENT)),
-            attempts: Mutex::new(HashMap::new()),
-        }
+    fn extract<T>(&self, request: &Request<T>) -> Result<IpAddr, GovernorError> {
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(peer)| peer.ip());
+        client_ip(self.header.as_ref(), request.headers(), peer)
+            .ok_or(GovernorError::UnableToExtractKey)
     }
+}
 
-    async fn admit(
-        &self,
-        source: IpAddr,
-    ) -> Result<OwnedSemaphorePermit, DeviceExchangeLimitError> {
-        let now = Instant::now();
-        let cutoff = now.checked_sub(DEVICE_EXCHANGE_RATE_WINDOW).unwrap_or(now);
-        let mut attempts = self.attempts.lock().await;
+fn client_ip(
+    header: Option<&HeaderName>,
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+) -> Option<IpAddr> {
+    header
+        .and_then(|name| headers.get_all(name).iter().next_back())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|address| address.trim().parse().ok())
+        .or(peer)
+}
 
-        if attempts.len() >= MAX_DEVICE_EXCHANGE_SOURCES && !attempts.contains_key(&source) {
-            attempts.retain(|_, entries| {
-                while entries.front().is_some_and(|attempt| *attempt <= cutoff) {
-                    entries.pop_front();
-                }
-                !entries.is_empty()
-            });
-            if attempts.len() >= MAX_DEVICE_EXCHANGE_SOURCES {
-                return Err(DeviceExchangeLimitError::RateLimited);
+/// Put the login rate limit in front of the browser-facing login routes.
+/// Must be called from within the Tokio runtime.
+pub fn rate_limit_logins(
+    routes: Router<AppState>,
+    client_ip_header: Option<HeaderName>,
+) -> Router<AppState> {
+    let config = Arc::new(
+        GovernorConfigBuilder::default()
+            .period(LOGIN_REPLENISH_INTERVAL)
+            .burst_size(LOGIN_BURST)
+            .key_extractor(ClientIpKeyExtractor {
+                header: client_ip_header,
+            })
+            .finish()
+            .expect("login rate limit is non-zero"),
+    );
+
+    // The limiter remembers every address it has seen; forget idle ones.
+    let limiter = Arc::downgrade(config.limiter());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match limiter.upgrade() {
+                Some(limiter) => limiter.retain_recent(),
+                None => break,
             }
         }
+    });
 
-        let entries = attempts.entry(source).or_default();
-        while entries.front().is_some_and(|attempt| *attempt <= cutoff) {
-            entries.pop_front();
-        }
-        if entries.len() >= DEVICE_EXCHANGE_RATE_LIMIT {
-            return Err(DeviceExchangeLimitError::RateLimited);
-        }
-        entries.push_back(now);
-        drop(attempts);
+    routes.layer(GovernorLayer::new(config).error_handler(login_rate_limit_response))
+}
 
-        self.permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| DeviceExchangeLimitError::Busy)
+fn login_rate_limit_response(error: GovernorError) -> axum::http::Response<Body> {
+    let request_id = Ulid::new().to_string();
+    match error {
+        GovernorError::TooManyRequests { wait_time, .. } => {
+            let mut response = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "oauth-login-rate-limited",
+                "Too many sign-in attempts",
+                "Wait before attempting another GitHub sign-in from this source.",
+                &request_id,
+            )
+            .into_response();
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(wait_time.max(1)));
+            response
+        }
+        GovernorError::UnableToExtractKey | GovernorError::Other { .. } => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal-error",
+            "Internal error",
+            "The client address could not be determined.",
+            &request_id,
+        )
+        .into_response(),
     }
 }
 
@@ -175,104 +226,351 @@ pub async fn version() -> Json<VersionResponse> {
     })
 }
 
-#[derive(Serialize)]
-struct OAuthSessionResponse {
-    access_token: String,
-    expires_in: u64,
-}
-
-#[derive(Serialize)]
-struct OAuthDeviceConfigResponse {
-    client_id: String,
-    device_code_url: String,
-    access_token_url: String,
-    scope: &'static str,
-}
-
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OAuthDeviceExchangeRequest {
-    access_token: String,
+pub struct AuthorizeParams {
+    response_type: Option<String>,
+    client_id: Option<String>,
+    redirect_uri: Option<String>,
+    state: Option<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
 }
 
-/// Return the public OAuth parameters a CLI needs for GitHub's device flow.
-/// No secret is exposed here: OAuth client IDs and the GitHub endpoints are
-/// public, while the client secret remains in the signer process.
-pub async fn github_oauth_device_config(State(state): State<AppState>) -> Response {
-    let config = state.auth.github_oauth_device_config();
-    let mut response = Json(OAuthDeviceConfigResponse {
-        client_id: config.client_id,
-        device_code_url: config.device_code_url,
-        access_token_url: config.access_token_url,
-        scope: config.scope,
-    })
-    .into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-}
-
-/// Convert a GitHub device-flow token into a short-lived signer-local session.
-/// The endpoint is source-rate-limited and globally concurrency-bounded before
-/// it can cause authenticated requests from the signer to GitHub.
-pub async fn github_oauth_device_exchange(
+/// OAuth 2.0 authorization endpoint for the signer CLI (authorization code
+/// flow with PKCE, loopback redirect). The signer has no login page of its
+/// own: it remembers the request and sends the browser on to GitHub.
+pub async fn oauth_authorize(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Bytes,
+    Query(params): Query<AuthorizeParams>,
 ) -> Result<Response, ApiError> {
     let request_id = Ulid::new().to_string();
-    let _admission = state
-        .device_exchange_limiter
-        .admit(peer.ip())
-        .await
-        .map_err(|error| device_exchange_limit_error(error, &request_id))?;
-    if !is_json_content_type(&headers) {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported-content-type",
-            "Unsupported content type",
-            "GitHub device-token exchanges must use Content-Type: application/json.",
-            &request_id,
-        ));
-    }
 
-    let request: OAuthDeviceExchangeRequest = serde_json::from_slice(&body).map_err(|_| {
+    // Nothing is redirected to the client on a malformed request: only the
+    // CLI builds these URLs, and an unvalidated redirect_uri must not be used.
+    let invalid = || {
         ApiError::new(
             StatusCode::BAD_REQUEST,
-            "malformed-json",
-            "Malformed GitHub device-token exchange",
-            "The request body must contain exactly one string field named access_token.",
+            "invalid-authorization-request",
+            "Invalid authorization request",
+            "Expected response_type=code, the signer CLI client_id, a loopback redirect_uri, state, and an S256 code_challenge.",
+            &request_id,
+        )
+    };
+    if params.response_type.as_deref() != Some("code")
+        || params.client_id.as_deref() != Some(CLI_CLIENT_ID)
+        || params.code_challenge_method.as_deref() != Some("S256")
+    {
+        return Err(invalid());
+    }
+    let request = AuthorizationRequest::new(
+        params.redirect_uri.as_deref().unwrap_or_default(),
+        params.state.as_deref().unwrap_or_default(),
+        params.code_challenge.as_deref().unwrap_or_default(),
+    )
+    .map_err(|_| invalid())?;
+
+    let github_url = state.auth.begin_github_login(request).map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth-capacity-exhausted",
+            "GitHub sign-in is temporarily unavailable",
+            "The signer is tracking too many unfinished sign-ins.",
             &request_id,
         )
     })?;
-    let access_token = Zeroizing::new(request.access_token);
-    let grant = state
-        .auth
-        .complete_github_device_oauth(access_token.as_str())
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                target: "microtun_signer::audit",
-                request_id = %request_id,
-                operation = "oauth-device-login",
-                success = false,
-                reason = %error,
-                "microtun signer login audit event"
-            );
-            oauth_flow_error(error, &request_id)
-        })?;
+    Ok(browser_redirect(&github_url))
+}
 
-    let mut response = Json(OAuthSessionResponse {
-        access_token: grant.access_token,
-        expires_in: grant.expires_in,
-    })
-    .into_response();
+#[derive(Debug, Deserialize)]
+pub struct GithubCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Where GitHub sends the browser back to. The signer exchanges GitHub's code
+/// itself, checks the account, and then redirects the browser to the CLI's
+/// loopback listener with a signer authorization code (or an OAuth error).
+pub async fn github_oauth_callback(
+    State(state): State<AppState>,
+    Query(params): Query<GithubCallbackParams>,
+) -> Response {
+    let request_id = Ulid::new().to_string();
+    let Ok(_permit) = state.login_permits.clone().try_acquire_owned() else {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth-login-busy",
+            "GitHub sign-in is busy",
+            "The signer is already processing the maximum number of GitHub sign-ins.",
+            &request_id,
+        )
+        .into_response();
+    };
+
+    // An unknown state cannot be tied to any CLI, so there is nowhere safe to
+    // redirect to and nothing is asked of GitHub.
+    let Some(pending) = params
+        .state
+        .as_deref()
+        .and_then(|github_state| state.auth.take_pending_login(github_state))
+    else {
+        return no_store((
+            StatusCode::BAD_REQUEST,
+            "This sign-in link has expired or was already used. Run the microtun-signer command again.\n",
+        ));
+    };
+
+    let outcome = match params.code.as_deref() {
+        Some(code) if params.error.is_none() => {
+            state.auth.finish_github_login(&pending, code).await
+        }
+        _ => Err(OAuthFlowError::AuthorizationDenied),
+    };
+    let Ok(mut redirect) = reqwest::Url::parse(&pending.request.redirect_uri) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match outcome {
+        Ok((code, account)) => {
+            audit_login(&request_id, "oauth-login", true, "ok", Some(&account));
+            redirect.query_pairs_mut().append_pair("code", &code);
+        }
+        Err(error) => {
+            audit_login(&request_id, "oauth-login", false, &error.to_string(), None);
+            redirect
+                .query_pairs_mut()
+                .append_pair("error", oauth_redirect_error_code(&error))
+                .append_pair("error_description", &error.to_string());
+        }
+    }
+    redirect
+        .query_pairs_mut()
+        .append_pair("state", &pending.request.state);
+    browser_redirect(&redirect)
+}
+
+#[derive(Deserialize)]
+pub struct TokenRequest {
+    grant_type: Option<String>,
+    client_id: Option<String>,
+    code: Option<String>,
+    redirect_uri: Option<String>,
+    code_verifier: Option<String>,
+    refresh_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TokenResponse {
+    access_token: String,
+    token_type: &'static str,
+    expires_in: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+}
+
+/// RFC 6749 section 5.2 error body, which is what OAuth client libraries
+/// expect from a token endpoint instead of the signer's usual error shape.
+#[derive(Serialize)]
+struct TokenErrorResponse {
+    error: &'static str,
+    error_description: &'static str,
+}
+
+fn token_error(status: StatusCode, error: &'static str, description: &'static str) -> Response {
+    no_store((
+        status,
+        Json(TokenErrorResponse {
+            error,
+            error_description: description,
+        }),
+    ))
+}
+
+/// OAuth 2.0 token endpoint: `authorization_code` (with PKCE) and
+/// `refresh_token` grants for the signer CLI. Neither grant contacts GitHub.
+pub async fn oauth_token(
+    State(state): State<AppState>,
+    form: Result<Form<TokenRequest>, FormRejection>,
+) -> Response {
+    let request_id = Ulid::new().to_string();
+    let Ok(Form(request)) = form else {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The token request must be application/x-www-form-urlencoded.",
+        );
+    };
+    let code = request.code.map(Zeroizing::new);
+    let refresh_token = request.refresh_token.map(Zeroizing::new);
+    if request.client_id.as_deref() != Some(CLI_CLIENT_ID) {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "Unknown client_id.",
+        );
+    }
+
+    let (operation, outcome) = match request.grant_type.as_deref() {
+        Some("authorization_code") => {
+            let (Some(code), Some(redirect_uri), Some(code_verifier)) =
+                (code, request.redirect_uri, request.code_verifier)
+            else {
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "code, redirect_uri, and code_verifier are required.",
+                );
+            };
+            (
+                "oauth-token",
+                state
+                    .auth
+                    .redeem_authorization_code(&code, &redirect_uri, &code_verifier),
+            )
+        }
+        Some("refresh_token") => {
+            let Some(refresh_token) = refresh_token else {
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "refresh_token is required.",
+                );
+            };
+            ("oauth-refresh", state.auth.refresh_session(&refresh_token))
+        }
+        _ => {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_grant_type",
+                "Supported grant types are authorization_code and refresh_token.",
+            );
+        }
+    };
+
+    match outcome {
+        Ok((tokens, account)) => {
+            audit_login(&request_id, operation, true, "ok", Some(&account));
+            no_store(Json(TokenResponse {
+                access_token: tokens.access_token,
+                token_type: "Bearer",
+                expires_in: tokens.expires_in,
+                refresh_token: tokens.refresh_token,
+            }))
+        }
+        Err(GrantError::RefreshTokenReused(account)) => {
+            audit_login(
+                &request_id,
+                operation,
+                false,
+                "refresh token reuse detected; login revoked",
+                Some(&account),
+            );
+            token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "The refresh token was already used; sign in again.",
+            )
+        }
+        Err(GrantError::Invalid) => {
+            audit_login(&request_id, operation, false, "invalid grant", None);
+            token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "The authorization code or refresh token is invalid or expired.",
+            )
+        }
+        Err(GrantError::Capacity) => token_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "The signer has reached its session capacity.",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RevocationRequest {
+    token: String,
+}
+
+/// OAuth 2.0 token revocation (RFC 7009). Revoking either the access or the
+/// refresh token ends that whole login. Unknown tokens also answer 200.
+pub async fn oauth_revoke(
+    State(state): State<AppState>,
+    form: Result<Form<RevocationRequest>, FormRejection>,
+) -> Response {
+    let request_id = Ulid::new().to_string();
+    let Ok(Form(request)) = form else {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The revocation request must be form-encoded and contain a token.",
+        );
+    };
+    let token = Zeroizing::new(request.token);
+    if let Some(account) = state.auth.revoke_session(&token) {
+        audit_login(&request_id, "oauth-logout", true, "ok", Some(&account));
+    }
+    no_store(StatusCode::OK)
+}
+
+/// Redirect a browser. The URL carries one-time credentials in its query, so
+/// keep it out of caches and out of any Referer header.
+fn browser_redirect(location: &reqwest::Url) -> Response {
+    let Ok(location) = HeaderValue::from_str(location.as_str()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut response = no_store(StatusCode::FOUND);
+    let headers = response.headers_mut();
+    headers.insert(LOCATION, location);
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    response
+}
+
+fn no_store(response: impl IntoResponse) -> Response {
+    let mut response = response.into_response();
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
-    Ok(response)
+    response
+}
+
+/// RFC 6749 section 4.1.2.1 error code reported to the CLI's redirect URI.
+fn oauth_redirect_error_code(error: &OAuthFlowError) -> &'static str {
+    match error {
+        OAuthFlowError::AuthorizationDenied
+        | OAuthFlowError::CodeExchangeFailed
+        | OAuthFlowError::ScopeNotGranted
+        | OAuthFlowError::ClaimsDenied
+        | OAuthFlowError::TwoFactorRequired => "access_denied",
+        OAuthFlowError::IdentityProviderUnavailable | OAuthFlowError::Capacity => {
+            "temporarily_unavailable"
+        }
+        OAuthFlowError::TokenRevocationFailed => "server_error",
+    }
+}
+
+fn audit_login(
+    request_id: &str,
+    operation: &str,
+    success: bool,
+    reason: &str,
+    account: Option<&Account>,
+) {
+    let identity_id = account.map_or("", |account| account.identity_id.as_str());
+    let github_user_id = account.map_or("", |account| account.user_id.as_str());
+    let github_login = account.map_or("", |account| account.login.as_str());
+    if success {
+        tracing::info!(
+            target: "microtun_signer::audit",
+            request_id, operation, success, reason, identity_id, github_user_id, github_login,
+            "microtun signer login audit event"
+        );
+    } else {
+        tracing::warn!(
+            target: "microtun_signer::audit",
+            request_id, operation, success, reason, identity_id, github_user_id, github_login,
+            "microtun signer login audit event"
+        );
+    }
 }
 
 pub async fn get_public_key(
@@ -930,93 +1228,6 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn oauth_flow_error(error: OAuthFlowError, request_id: &str) -> ApiError {
-    match error {
-        OAuthFlowError::TokenValidationFailed => ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "oauth-token-invalid",
-            "GitHub OAuth token is invalid",
-            "The token is invalid or was not issued to this signer's GitHub OAuth application.",
-            request_id,
-        ),
-        OAuthFlowError::TokenReplayed => ApiError::new(
-            StatusCode::CONFLICT,
-            "oauth-token-replayed",
-            "GitHub OAuth token has already been used",
-            "Start a new GitHub device authorization and try again.",
-            request_id,
-        ),
-        OAuthFlowError::ReplayCacheUnavailable => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "oauth-replay-cache-unavailable",
-            "GitHub OAuth login is temporarily unavailable",
-            "The signer cannot safely record the one-time bootstrap token.",
-            request_id,
-        ),
-        OAuthFlowError::ScopeNotGranted => ApiError::new(
-            StatusCode::FORBIDDEN,
-            "oauth-scope-not-granted",
-            "GitHub did not grant the read:user scope",
-            "The read:user scope is required to verify two-factor authentication.",
-            request_id,
-        ),
-        OAuthFlowError::IdentityProviderUnavailable => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "identity-provider-unavailable",
-            "GitHub identity verification is temporarily unavailable",
-            "The signer could not complete GitHub OAuth authentication.",
-            request_id,
-        ),
-        OAuthFlowError::TokenRevocationFailed => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "oauth-token-revocation-failed",
-            "GitHub OAuth token revocation failed",
-            "The signer will not issue a local session until the GitHub bootstrap token is revoked.",
-            request_id,
-        ),
-        OAuthFlowError::ClaimsDenied => ApiError::new(
-            StatusCode::FORBIDDEN,
-            "identity-not-authorized",
-            "Authenticated identity is not authorized",
-            "The authenticated GitHub account is not configured as a signer identity.",
-            request_id,
-        ),
-        OAuthFlowError::TwoFactorRequired => ApiError::new(
-            StatusCode::FORBIDDEN,
-            "github-2fa-required",
-            "GitHub two-factor authentication is required",
-            "Enable two-factor authentication on the GitHub account and log in again.",
-            request_id,
-        ),
-        OAuthFlowError::SessionCapacity => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "oauth-capacity-exhausted",
-            "GitHub OAuth login is temporarily unavailable",
-            "The signer has reached its temporary OAuth session capacity.",
-            request_id,
-        ),
-    }
-}
-
-fn device_exchange_limit_error(error: DeviceExchangeLimitError, request_id: &str) -> ApiError {
-    match error {
-        DeviceExchangeLimitError::RateLimited => ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "oauth-device-rate-limited",
-            "Too many GitHub device-token exchanges",
-            "Wait before attempting another GitHub device-token exchange from this source.",
-            request_id,
-        ),
-        DeviceExchangeLimitError::Busy => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "oauth-device-busy",
-            "GitHub device-token exchange is busy",
-            "The signer is already processing the maximum number of GitHub device-token exchanges.",
-            request_id,
-        ),
-    }
-}
-
 fn auth_error(error: AuthError, request_id: &str) -> ApiError {
     match error {
         AuthError::ClaimsDenied => ApiError::new(
@@ -1250,41 +1461,32 @@ mod tests {
     }
 
     #[test]
-    fn oauth_device_exchange_accepts_only_access_token() {
-        let request: OAuthDeviceExchangeRequest =
-            serde_json::from_str(r#"{"access_token":"gho_test"}"#).unwrap();
-        assert_eq!(request.access_token, "gho_test");
-        let with_extra = r#"{"access_token":"gho_test","unexpected":"x"}"#;
-        assert!(serde_json::from_str::<OAuthDeviceExchangeRequest>(with_extra).is_err());
-    }
+    fn client_ip_prefers_the_last_hop_of_the_configured_header() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let header = HeaderName::from_static("x-forwarded-for");
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_ip(Some(&header), &headers, Some(peer)), Some(peer));
 
-    #[tokio::test]
-    async fn device_exchange_rate_limiter_caps_each_peer() {
-        let limiter = DeviceExchangeLimiter::new();
-        let source: IpAddr = "127.0.0.1".parse().unwrap();
-        for _ in 0..DEVICE_EXCHANGE_RATE_LIMIT {
-            drop(limiter.admit(source).await.unwrap());
-        }
+        // The client claims 1.1.1.1; the proxy appended the address it saw.
+        headers.insert(&header, "1.1.1.1, 203.0.113.7".parse().unwrap());
+        let seen_by_proxy: IpAddr = "203.0.113.7".parse().unwrap();
         assert_eq!(
-            limiter.admit(source).await.unwrap_err(),
-            DeviceExchangeLimitError::RateLimited
+            client_ip(Some(&header), &headers, Some(peer)),
+            Some(seen_by_proxy)
         );
-    }
+        // Not configured: the header is client-controlled and ignored.
+        assert_eq!(client_ip(None, &headers, Some(peer)), Some(peer));
 
-    #[tokio::test]
-    async fn device_exchange_limiter_rejects_excess_concurrency() {
-        let limiter = DeviceExchangeLimiter::new();
-        let source: IpAddr = "127.0.0.1".parse().unwrap();
-        let mut permits = Vec::new();
-        for _ in 0..DEVICE_EXCHANGE_MAX_CONCURRENT {
-            permits.push(limiter.admit(source).await.unwrap());
-        }
+        // A proxy that adds its own header line rather than appending.
+        headers.append(&header, "2001:db8::1".parse().unwrap());
         assert_eq!(
-            limiter.admit(source).await.unwrap_err(),
-            DeviceExchangeLimitError::Busy
+            client_ip(Some(&header), &headers, Some(peer)),
+            Some("2001:db8::1".parse().unwrap())
         );
-        permits.pop();
-        assert!(limiter.admit(source).await.is_ok());
+
+        headers.insert(&header, "garbage".parse().unwrap());
+        assert_eq!(client_ip(Some(&header), &headers, Some(peer)), Some(peer));
+        assert_eq!(client_ip(Some(&header), &headers, None), None);
     }
 
     #[test]

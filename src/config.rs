@@ -18,6 +18,8 @@ const CONFIG_API_VERSION_ID: &str = "microtun.dev/v1alpha1";
 const CONFIG_KIND: &str = "SignerConfig";
 /// Human sessions can sign without any build provenance, so keep them short.
 pub const MAX_OAUTH_SESSION_TTL_SECONDS: u64 = 60 * 60;
+/// Upper bound on how long refresh tokens may keep one GitHub login alive.
+pub const MAX_OAUTH_REFRESH_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +56,17 @@ pub struct MicrotunConfig {
 pub struct ServerConfig {
     #[serde(rename = "Listen")]
     pub listen: SocketAddr,
+    /// Externally visible base URL of the public API, as browsers and the CLI
+    /// reach it through the TLS reverse proxy. GitHub redirects users back to
+    /// `<PublicURL>/v1/auth/github/callback` after they sign in.
+    #[serde(rename = "PublicURL")]
+    pub public_url: String,
+    /// Header in which the reverse proxy reports the client address, used to
+    /// rate-limit logins per client instead of per proxy. Only safe when
+    /// every request arrives through that proxy; otherwise clients can set
+    /// the header themselves.
+    #[serde(rename = "ClientIPHeader", default)]
+    pub client_ip_header: Option<String>,
     #[serde(rename = "AdminSocketPath", default = "default_admin_socket_path")]
     pub admin_socket_path: PathBuf,
     #[serde(rename = "AdminSocketMode", default = "default_admin_socket_mode")]
@@ -67,6 +80,15 @@ pub struct ServerConfig {
     /// loopback address requires this explicit opt-in.
     #[serde(rename = "AllowNonLoopbackListen", default)]
     pub allow_non_loopback_listen: bool,
+}
+
+impl ServerConfig {
+    /// `None` when unset. Validation guarantees a set value parses.
+    pub fn client_ip_header_name(&self) -> Option<axum::http::HeaderName> {
+        self.client_ip_header
+            .as_deref()
+            .and_then(|name| name.parse().ok())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,10 +161,12 @@ impl KeyState {
 
 /// GitHub OAuth application and REST API settings for human identities.
 ///
-/// The CLI performs GitHub's device flow as a public client. The signer keeps
-/// the OAuth client secret, verifies that the resulting GitHub token belongs to
-/// this exact OAuth App, revokes it, and issues its own short-lived bearer
-/// session. GitHub access tokens are never accepted directly by the signing API.
+/// The signer is a confidential client of this OAuth App: it sends the user's
+/// browser to GitHub (authorization code flow), exchanges the returned code
+/// with the client secret, resolves the account, revokes the GitHub token, and
+/// issues its own short-lived access token plus a rotating refresh token to
+/// the CLI. GitHub tokens never leave the signer and are never accepted by
+/// the signing API.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GithubConfig {
@@ -156,10 +180,10 @@ pub struct GithubConfig {
     )]
     pub oauth_access_token_url: String,
     #[serde(
-        rename = "OAuthDeviceCodeURL",
-        default = "default_github_oauth_device_code_url"
+        rename = "OAuthAuthorizeURL",
+        default = "default_github_oauth_authorize_url"
     )]
-    pub oauth_device_code_url: String,
+    pub oauth_authorize_url: String,
     #[serde(rename = "OAuthClientID")]
     pub oauth_client_id: String,
     #[serde(
@@ -172,6 +196,14 @@ pub struct GithubConfig {
         default = "default_oauth_session_ttl_seconds"
     )]
     pub oauth_session_ttl_seconds: u64,
+    /// Absolute lifetime of one GitHub login. Within it the CLI silently
+    /// trades its refresh token for new access tokens; afterwards the user
+    /// must sign in with GitHub again. Zero disables refresh tokens.
+    #[serde(
+        rename = "OAuthRefreshTTLSeconds",
+        default = "default_oauth_refresh_ttl_seconds"
+    )]
+    pub oauth_refresh_ttl_seconds: u64,
 }
 
 /// GitHub Actions OIDC verifier infrastructure. Repository/workflow trust is
@@ -294,6 +326,11 @@ impl Config {
         {
             bail!("Server.AdminSocketGroup must be a valid POSIX group name");
         }
+        validate_public_url(&self.server.public_url)?;
+        if self.server.client_ip_header.is_some() && self.server.client_ip_header_name().is_none() {
+            bail!("Server.ClientIPHeader must be a valid HTTP header name such as X-Forwarded-For");
+        }
+
         if !self.server.admin_socket_path.is_absolute() {
             bail!("Server.AdminSocketPath must be an absolute path");
         }
@@ -365,10 +402,11 @@ impl Config {
             "GitHub.OAuthAccessTokenURL",
             &self.github.oauth_access_token_url,
         )?;
-        validate_https_url(
-            "GitHub.OAuthDeviceCodeURL",
-            &self.github.oauth_device_code_url,
-        )?;
+        let authorize_url =
+            validate_https_url("GitHub.OAuthAuthorizeURL", &self.github.oauth_authorize_url)?;
+        if authorize_url.query().is_some() || authorize_url.fragment().is_some() {
+            bail!("GitHub.OAuthAuthorizeURL must not contain a query string or fragment");
+        }
         // The client ID is also interpolated into the token revocation URL.
         if !valid_key_id(&self.github.oauth_client_id) {
             bail!("GitHub.OAuthClientID must match [A-Za-z0-9._-]{{1,128}}");
@@ -381,6 +419,15 @@ impl Config {
         {
             bail!(
                 "GitHub.OAuthSessionTTLSeconds must be between 1 and {MAX_OAUTH_SESSION_TTL_SECONDS} seconds"
+            );
+        }
+        let refresh_ttl = self.github.oauth_refresh_ttl_seconds;
+        if refresh_ttl != 0
+            && (refresh_ttl < self.github.oauth_session_ttl_seconds
+                || refresh_ttl > MAX_OAUTH_REFRESH_TTL_SECONDS)
+        {
+            bail!(
+                "GitHub.OAuthRefreshTTLSeconds must be 0 (refresh tokens disabled) or between GitHub.OAuthSessionTTLSeconds and {MAX_OAUTH_REFRESH_TTL_SECONDS} seconds"
             );
         }
 
@@ -622,6 +669,30 @@ fn validate_https_url(field: &str, value: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+/// The public URL is where browsers are sent back to after GitHub sign-in, so
+/// it must be HTTPS. Plain HTTP is accepted only for a loopback host, which is
+/// what local development without a reverse proxy looks like.
+fn validate_public_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("Server.PublicURL must be a valid http(s) URL")?;
+    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
+    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        || url.host_str().is_none()
+    {
+        bail!("Server.PublicURL must use https:// (http:// is allowed for loopback hosts only)");
+    }
+    if value.ends_with('/')
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!(
+            "Server.PublicURL must not have a trailing slash, credentials, query string, or fragment"
+        );
+    }
+    Ok(())
+}
+
 fn validate_numeric_id(field: &str, value: &str) -> Result<()> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         bail!("{field} must be a numeric GitHub id");
@@ -689,8 +760,8 @@ fn default_github_oauth_access_token_url() -> String {
     "https://github.com/login/oauth/access_token".to_owned()
 }
 
-fn default_github_oauth_device_code_url() -> String {
-    "https://github.com/login/device/code".to_owned()
+fn default_github_oauth_authorize_url() -> String {
+    "https://github.com/login/oauth/authorize".to_owned()
 }
 
 fn default_github_oauth_client_secret_credential() -> String {
@@ -699,6 +770,10 @@ fn default_github_oauth_client_secret_credential() -> String {
 
 const fn default_oauth_session_ttl_seconds() -> u64 {
     15 * 60
+}
+
+const fn default_oauth_refresh_ttl_seconds() -> u64 {
+    8 * 60 * 60
 }
 
 fn default_audience() -> String {
@@ -725,6 +800,7 @@ Kind = "SignerConfig"
 
 [Server]
 Listen = "127.0.0.1:8080"
+PublicURL = "https://signer.example.com"
 
 [[Key]]
 ID = "test-key"
@@ -1180,6 +1256,79 @@ Keys = ["test-key"]
         );
         let error = validate(&text).unwrap_err().to_string();
         assert!(error.contains("OAuthSessionTTLSeconds"), "{error}");
+    }
+
+    #[test]
+    fn oauth_refresh_ttl_defaults_to_a_working_day_and_is_bounded() {
+        let config = validate(&account_config()).unwrap();
+        assert_eq!(config.github.oauth_refresh_ttl_seconds, 8 * 60 * 60);
+
+        let with_ttl = |ttl: u64| {
+            account_config().replace(
+                "[GitHubActions]",
+                &format!("OAuthRefreshTTLSeconds = {ttl}\n\n[GitHubActions]"),
+            )
+        };
+        // Zero turns refresh tokens off.
+        assert_eq!(
+            validate(&with_ttl(0))
+                .unwrap()
+                .github
+                .oauth_refresh_ttl_seconds,
+            0
+        );
+        validate(&with_ttl(900)).unwrap();
+        validate(&with_ttl(MAX_OAUTH_REFRESH_TTL_SECONDS)).unwrap();
+        for rejected in [899, MAX_OAUTH_REFRESH_TTL_SECONDS + 1] {
+            let error = validate(&with_ttl(rejected)).unwrap_err().to_string();
+            assert!(error.contains("OAuthRefreshTTLSeconds"), "{error}");
+        }
+    }
+
+    #[test]
+    fn public_url_must_be_https_unless_loopback() {
+        let with_url = |url: &str| account_config().replace("https://signer.example.com", url);
+        validate(&with_url("https://signer.example.com/prefix")).unwrap();
+        validate(&with_url("http://127.0.0.1:8080")).unwrap();
+        validate(&with_url("http://localhost:8080")).unwrap();
+        for rejected in [
+            "http://signer.example.com",
+            "https://signer.example.com/",
+            "https://user@signer.example.com",
+            "https://signer.example.com?x=1",
+            "ftp://signer.example.com",
+            "not a url",
+        ] {
+            let error = validate(&with_url(rejected)).unwrap_err().to_string();
+            assert!(error.contains("PublicURL"), "{rejected}: {error}");
+        }
+
+        let error =
+            validate(&account_config().replace("PublicURL = \"https://signer.example.com\"\n", ""))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("PublicURL"), "{error}");
+    }
+
+    #[test]
+    fn client_ip_header_is_optional_and_validated() {
+        let with_header = |header: &str| {
+            account_config().replace(
+                "Listen = \"127.0.0.1:8080\"",
+                &format!("Listen = \"127.0.0.1:8080\"\nClientIPHeader = \"{header}\""),
+            )
+        };
+        let config = validate(&account_config()).unwrap();
+        assert!(config.server.client_ip_header_name().is_none());
+        let config = validate(&with_header("X-Forwarded-For")).unwrap();
+        assert_eq!(
+            config.server.client_ip_header_name().unwrap().as_str(),
+            "x-forwarded-for"
+        );
+        for rejected in ["", "bad header", "x:y"] {
+            let error = validate(&with_header(rejected)).unwrap_err().to_string();
+            assert!(error.contains("ClientIPHeader"), "{rejected}: {error}");
+        }
     }
 
     #[test]

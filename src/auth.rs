@@ -1,14 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::http::{HeaderMap, header::AUTHORIZATION};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use zeroize::Zeroizing;
@@ -16,12 +14,13 @@ use zeroize::Zeroizing;
 use crate::{
     config::{GithubActionsConfig, GithubConfig, IdentityConfig, IdentityKind},
     key::load_systemd_credential,
+    oauth::{Account, AuthorizationRequest, GrantError, OAuthStore, PendingLogin, TokenGrant},
 };
 
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const GITHUB_ACCOUNT_ISSUER: &str = "https://github.com";
 const MAX_BEARER_TOKEN_BYTES: usize = 16 * 1024;
-const MAX_OAUTH_SESSIONS: usize = 4096;
+const MAX_GITHUB_CODE_BYTES: usize = 1024;
 
 /// Upper bound on remembered GitHub Actions `jti` values. Entries are only
 /// recorded for tokens that already resolved to a configured identity, so
@@ -43,9 +42,9 @@ const JWKS_MAX_BYTES: usize = 256 * 1024;
 /// `read:user` makes GitHub include `two_factor_authentication` in the
 /// `GET /user` response. The GitHub token is revoked immediately after use.
 const OAUTH_SCOPE: &str = "read:user";
-const SESSION_TOKEN_PREFIX: &str = "mts_";
-const MAX_USED_DEVICE_TOKENS: usize = 65_536;
-const DEVICE_TOKEN_REPLAY_TTL: Duration = Duration::from_secs(60 * 60);
+/// Path below `Server.PublicURL` that GitHub redirects users back to. It must
+/// be registered as the OAuth App's authorization callback URL.
+pub const GITHUB_CALLBACK_PATH: &str = "/v1/auth/github/callback";
 
 #[derive(Clone)]
 pub struct Authenticator {
@@ -55,16 +54,16 @@ pub struct Authenticator {
 struct Inner {
     github: GithubConfig,
     github_oauth_client_secret: Zeroizing<String>,
+    /// `<Server.PublicURL>/v1/auth/github/callback`.
+    github_redirect_uri: String,
     actions: GithubActionsConfig,
     identities: Vec<IdentityConfig>,
     http: reqwest::Client,
     jwks: RwLock<JwksCache>,
     /// Serialises JWKS refreshes so concurrent cache misses cause one fetch.
     jwks_refresh: AsyncMutex<()>,
-    /// Device-flow bootstrap tokens are single-use within this process.
-    device_token_replay: Mutex<DeviceTokenReplay>,
-    /// Keyed by SHA-256 of the bearer token; raw session tokens are never stored.
-    oauth_sessions: RwLock<HashMap<[u8; 32], GithubAccountSession>>,
+    /// Pending logins, authorization codes, and signer-local sessions.
+    oauth: OAuthStore,
     seen_jtis: Mutex<HashMap<String, Instant>>,
 }
 
@@ -73,50 +72,6 @@ struct JwksCache {
     fetched_at: Option<Instant>,
     last_attempt: Option<Instant>,
     keys: HashMap<String, RsaJwk>,
-}
-
-#[derive(Default)]
-struct DeviceTokenReplay {
-    in_flight: HashSet<[u8; 32]>,
-    used: HashMap<[u8; 32], Instant>,
-}
-
-struct DeviceTokenUseGuard {
-    inner: Arc<Inner>,
-    key: [u8; 32],
-}
-
-impl DeviceTokenUseGuard {
-    fn mark_consumed(&self) -> Result<(), OAuthFlowError> {
-        let now = Instant::now();
-        let mut replay = self
-            .inner
-            .device_token_replay
-            .lock()
-            .map_err(|_| OAuthFlowError::ReplayCacheUnavailable)?;
-        replay.used.retain(|_, expires_at| *expires_at > now);
-        if replay.used.len() >= MAX_USED_DEVICE_TOKENS && !replay.used.contains_key(&self.key) {
-            return Err(OAuthFlowError::ReplayCacheUnavailable);
-        }
-        replay.used.insert(self.key, now + DEVICE_TOKEN_REPLAY_TTL);
-        Ok(())
-    }
-}
-
-impl Drop for DeviceTokenUseGuard {
-    fn drop(&mut self) {
-        if let Ok(mut replay) = self.inner.device_token_replay.lock() {
-            replay.in_flight.remove(&self.key);
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GithubAccountSession {
-    expires_at: Instant,
-    identity_id: String,
-    user_id: String,
-    login: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -185,20 +140,13 @@ struct GithubUserResponse {
     two_factor_authentication: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GithubTokenCheckResponse {
-    scopes: Vec<String>,
-    app: GithubTokenCheckApp,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubTokenCheckApp {
-    client_id: String,
-}
-
-#[derive(Serialize)]
-struct GithubTokenCheckRequest<'a> {
-    access_token: &'a str,
+/// GitHub answers the code exchange with HTTP 200 for both outcomes: either
+/// `access_token` and `scope`, or an OAuth `error`.
+#[derive(Deserialize)]
+struct GithubTokenResponse {
+    access_token: Option<String>,
+    scope: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -249,20 +197,6 @@ pub struct AuthPrincipal {
     pub source: AuthSource,
 }
 
-#[derive(Clone, Debug)]
-pub struct OAuthDeviceConfig {
-    pub client_id: String,
-    pub device_code_url: String,
-    pub access_token_url: String,
-    pub scope: &'static str,
-}
-
-#[derive(Clone, Debug)]
-pub struct OAuthSessionGrant {
-    pub access_token: String,
-    pub expires_in: u64,
-}
-
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("authorization bearer token is missing or malformed")]
@@ -283,30 +217,31 @@ pub enum AuthError {
     ClaimsDenied,
 }
 
+/// Why a GitHub sign-in did not produce a signer authorization code. The
+/// messages are shown to the user by the CLI.
 #[derive(Debug, Error)]
 pub enum OAuthFlowError {
-    #[error("GitHub OAuth token is invalid or was not issued to this signer application")]
-    TokenValidationFailed,
-    #[error("GitHub OAuth bootstrap token has already been used")]
-    TokenReplayed,
-    #[error("GitHub OAuth replay cache is unavailable")]
-    ReplayCacheUnavailable,
-    #[error("GitHub OAuth token was not granted the required scope")]
+    #[error("GitHub sign-in was cancelled or denied")]
+    AuthorizationDenied,
+    #[error("GitHub rejected the authorization code")]
+    CodeExchangeFailed,
+    #[error("GitHub did not grant the read:user scope needed to verify two-factor authentication")]
     ScopeNotGranted,
-    #[error("GitHub identity provider is temporarily unavailable")]
+    #[error("GitHub is temporarily unavailable")]
     IdentityProviderUnavailable,
-    #[error("GitHub OAuth token could not be revoked")]
+    #[error("the temporary GitHub token could not be revoked, so no signer session was issued")]
     TokenRevocationFailed,
-    #[error("authenticated GitHub account does not match a configured identity")]
+    #[error("this GitHub account is not a configured signer identity")]
     ClaimsDenied,
-    #[error("authenticated GitHub account does not have two-factor authentication enabled")]
+    #[error("this GitHub account does not have two-factor authentication enabled")]
     TwoFactorRequired,
-    #[error("too many OAuth sessions are active")]
-    SessionCapacity,
+    #[error("the signer is handling too many sign-ins right now")]
+    Capacity,
 }
 
 impl Authenticator {
     pub fn new(
+        public_url: &str,
         github: GithubConfig,
         actions: GithubActionsConfig,
         identities: Vec<IdentityConfig>,
@@ -320,174 +255,242 @@ impl Authenticator {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("microtun-signer/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self {
+        Ok(Self::assemble(
+            public_url,
+            github,
+            github_oauth_client_secret,
+            actions,
+            identities,
+            http,
+        ))
+    }
+
+    fn assemble(
+        public_url: &str,
+        github: GithubConfig,
+        github_oauth_client_secret: Zeroizing<String>,
+        actions: GithubActionsConfig,
+        identities: Vec<IdentityConfig>,
+        http: reqwest::Client,
+    ) -> Self {
+        let oauth = OAuthStore::new(
+            Duration::from_secs(github.oauth_session_ttl_seconds),
+            (github.oauth_refresh_ttl_seconds != 0)
+                .then(|| Duration::from_secs(github.oauth_refresh_ttl_seconds)),
+        );
+        Self {
             inner: Arc::new(Inner {
                 github,
                 github_oauth_client_secret,
+                github_redirect_uri: format!("{public_url}{GITHUB_CALLBACK_PATH}"),
                 actions,
                 identities,
                 http,
                 jwks: RwLock::new(JwksCache::default()),
                 jwks_refresh: AsyncMutex::new(()),
-                device_token_replay: Mutex::new(DeviceTokenReplay::default()),
-                oauth_sessions: RwLock::new(HashMap::new()),
+                oauth,
                 seen_jtis: Mutex::new(HashMap::new()),
             }),
-        })
-    }
-
-    /// Public parameters needed by a CLI to run GitHub's OAuth device flow.
-    /// The client ID and endpoint URLs are not secrets; the client secret stays
-    /// server-side and is used later to verify that the returned token belongs
-    /// to this OAuth application.
-    pub fn github_oauth_device_config(&self) -> OAuthDeviceConfig {
-        OAuthDeviceConfig {
-            client_id: self.inner.github.oauth_client_id.clone(),
-            device_code_url: self.inner.github.oauth_device_code_url.clone(),
-            access_token_url: self.inner.github.oauth_access_token_url.clone(),
-            scope: OAUTH_SCOPE,
         }
     }
 
-    /// Exchange a GitHub device-flow user token for the signer's own short-lived
-    /// session. The token must be single-use, belong to this exact OAuth App,
-    /// resolve to an authorized 2FA-enabled account, and be revoked at GitHub
-    /// before any signer-local session is minted.
-    pub async fn complete_github_device_oauth(
+    /// Start a login for a validated CLI authorization request and return the
+    /// GitHub URL the user's browser must be sent to.
+    pub fn begin_github_login(
         &self,
-        access_token: &str,
-    ) -> Result<OAuthSessionGrant, OAuthFlowError> {
-        if access_token.is_empty() || access_token.len() > MAX_BEARER_TOKEN_BYTES {
-            return Err(OAuthFlowError::TokenValidationFailed);
-        }
+        request: AuthorizationRequest,
+    ) -> Result<reqwest::Url, OAuthFlowError> {
+        let github = &self.inner.github;
+        let mut url = reqwest::Url::parse(&github.oauth_authorize_url)
+            .map_err(|_| OAuthFlowError::IdentityProviderUnavailable)?;
+        let (state, code_challenge) = self
+            .inner
+            .oauth
+            .begin_login(request)
+            .map_err(|_| OAuthFlowError::Capacity)?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &github.oauth_client_id)
+            .append_pair("redirect_uri", &self.inner.github_redirect_uri)
+            .append_pair("scope", OAUTH_SCOPE)
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("allow_signup", "false");
+        Ok(url)
+    }
 
-        let use_guard = self.begin_device_token_use(access_token)?;
-        let granted_scopes = self.check_github_oauth_token(access_token).await?;
+    /// Consume the login that GitHub's `state` parameter refers to.
+    pub fn take_pending_login(&self, state: &str) -> Option<PendingLogin> {
+        if state.len() > MAX_GITHUB_CODE_BYTES {
+            return None;
+        }
+        self.inner.oauth.take_pending_login(state)
+    }
+
+    /// Turn GitHub's authorization code into a signer authorization code for
+    /// the CLI. The GitHub token obtained on the way must resolve to a
+    /// configured 2FA-enabled account and is revoked at GitHub before
+    /// anything is issued; it is never stored and never leaves the signer.
+    pub async fn finish_github_login(
+        &self,
+        pending: &PendingLogin,
+        github_code: &str,
+    ) -> Result<(String, Account), OAuthFlowError> {
+        if github_code.is_empty() || github_code.len() > MAX_GITHUB_CODE_BYTES {
+            return Err(OAuthFlowError::CodeExchangeFailed);
+        }
+        let (github_token, granted_scopes) = self
+            .exchange_github_code(github_code, &pending.github_code_verifier)
+            .await?;
 
         let outcome = self
-            .github_account_from_token(access_token, &granted_scopes)
+            .github_account_from_token(&github_token, &granted_scopes)
             .await;
 
         // Revocation is fail-closed. Even a valid configured account receives
-        // no signer session unless the GitHub bootstrap credential is gone. A
-        // revocation failure deliberately leaves the token retryable so a
-        // later request can try to revoke it again.
-        self.revoke_github_token(access_token).await?;
+        // no signer session unless the GitHub credential is gone.
+        self.revoke_github_token(&github_token).await?;
 
-        // Only a token proven to belong to this OAuth App and successfully
-        // revoked at GitHub enters the retained replay cache. In-flight replay
-        // protection covers the entire exchange before this point.
-        use_guard.mark_consumed()?;
-        let (identity_id, user) = outcome?;
-        self.mint_github_account_session(identity_id, user).await
-    }
-
-    fn begin_device_token_use(
-        &self,
-        access_token: &str,
-    ) -> Result<DeviceTokenUseGuard, OAuthFlowError> {
-        let key = session_key(access_token);
-        let now = Instant::now();
-        let mut replay = self
+        let account = outcome?;
+        let code = self
             .inner
-            .device_token_replay
-            .lock()
-            .map_err(|_| OAuthFlowError::ReplayCacheUnavailable)?;
-        replay.used.retain(|_, expires_at| *expires_at > now);
-        if replay.used.contains_key(&key) || !replay.in_flight.insert(key) {
-            return Err(OAuthFlowError::TokenReplayed);
-        }
-        drop(replay);
-        Ok(DeviceTokenUseGuard {
-            inner: self.inner.clone(),
-            key,
-        })
+            .oauth
+            .issue_code(&pending.request, account.clone())
+            .map_err(|_| OAuthFlowError::Capacity)?;
+        Ok((code, account))
     }
 
-    async fn mint_github_account_session(
+    /// Token endpoint, `grant_type=authorization_code`.
+    pub fn redeem_authorization_code(
         &self,
-        identity_id: String,
-        user: GithubUserResponse,
-    ) -> Result<OAuthSessionGrant, OAuthFlowError> {
-        let now = Instant::now();
-        let expires_in = self.inner.github.oauth_session_ttl_seconds;
-        let session = GithubAccountSession {
-            expires_at: now + Duration::from_secs(expires_in),
-            identity_id,
-            user_id: user.id.to_string(),
-            login: user.login,
-        };
-        let token = format!(
-            "{SESSION_TOKEN_PREFIX}{}",
-            B64URL.encode(random_bytes::<32>())
-        );
-
-        let mut sessions = self.inner.oauth_sessions.write().await;
-        sessions.retain(|_, session| session.expires_at > now);
-        if sessions.len() >= MAX_OAUTH_SESSIONS {
-            return Err(OAuthFlowError::SessionCapacity);
+        code: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<(TokenGrant, Account), GrantError> {
+        if code.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(GrantError::Invalid);
         }
-        sessions.insert(session_key(&token), session);
+        self.inner
+            .oauth
+            .redeem_code(code, redirect_uri, code_verifier)
+    }
 
-        Ok(OAuthSessionGrant {
-            access_token: token,
-            expires_in,
-        })
+    /// Token endpoint, `grant_type=refresh_token`.
+    ///
+    /// This does not go back to GitHub: the GitHub token was revoked at login.
+    /// How long a login may be extended this way is bounded by
+    /// `GitHub.OAuthRefreshTTLSeconds`.
+    pub fn refresh_session(
+        &self,
+        refresh_token: &str,
+    ) -> Result<(TokenGrant, Account), GrantError> {
+        if refresh_token.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(GrantError::Invalid);
+        }
+        self.inner.oauth.refresh(refresh_token)
+    }
+
+    /// Revocation endpoint: ends the login the token belongs to.
+    pub fn revoke_session(&self, token: &str) -> Option<Account> {
+        if token.len() > MAX_BEARER_TOKEN_BYTES {
+            return None;
+        }
+        self.inner.oauth.revoke(token)
     }
 
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<AuthPrincipal, AuthError> {
         let token = bearer_token(headers)?;
 
         // GitHub Actions OIDC tokens are JWTs. All other accepted credentials
-        // must be signer-local sessions minted by our own GitHub OAuth flow;
+        // must be signer-local access tokens minted by our own OAuth flow;
         // arbitrary GitHub OAuth/App bearer tokens are deliberately rejected.
         if is_github_actions_jwt(token) {
             self.authenticate_github_actions(token).await
         } else {
-            self.authenticate_github_account_session(token).await
+            self.authenticate_github_account_session(token)
         }
     }
 
-    async fn authenticate_github_account_session(
-        &self,
-        token: &str,
-    ) -> Result<AuthPrincipal, AuthError> {
-        if !token.starts_with(SESSION_TOKEN_PREFIX) {
-            return Err(AuthError::InvalidToken);
-        }
-
-        let now = Instant::now();
-        let session = {
-            let sessions = self.inner.oauth_sessions.read().await;
-            sessions
-                .get(&session_key(token))
-                .filter(|session| session.expires_at > now)
-                .cloned()
-                .ok_or(AuthError::InvalidToken)?
-        };
+    fn authenticate_github_account_session(&self, token: &str) -> Result<AuthPrincipal, AuthError> {
+        let account = self
+            .inner
+            .oauth
+            .authenticate(token)
+            .ok_or(AuthError::InvalidToken)?;
 
         Ok(AuthPrincipal {
-            identity_id: session.identity_id,
-            principal_key: format!("github-account:{}", session.user_id),
+            identity_id: account.identity_id,
+            principal_key: format!("github-account:{}", account.user_id),
             auth_method: "github-oauth-session",
             issuer: GITHUB_ACCOUNT_ISSUER.to_owned(),
             audience: Some(self.inner.github.oauth_client_id.clone()),
-            subject: session.user_id.clone(),
+            subject: account.user_id.clone(),
             jti: None,
             source: AuthSource::GithubAccount(GithubAccountIdentity {
-                user_id: session.user_id,
-                login: session.login,
+                user_id: account.user_id,
+                login: account.login,
             }),
         })
     }
 
-    /// Resolve a verified GitHub OAuth token to a configured identity whose
-    /// account has two-factor authentication enabled.
+    /// Exchange GitHub's authorization code as a confidential client. Only
+    /// the holder of the client secret can do this, so the resulting token is
+    /// known to belong to this exact OAuth App.
+    async fn exchange_github_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<(Zeroizing<String>, Vec<String>), OAuthFlowError> {
+        let github = &self.inner.github;
+        let response = self
+            .inner
+            .http
+            .post(&github.oauth_access_token_url)
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", github.oauth_client_id.as_str()),
+                (
+                    "client_secret",
+                    self.inner.github_oauth_client_secret.as_str(),
+                ),
+                ("code", code),
+                ("redirect_uri", self.inner.github_redirect_uri.as_str()),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .await
+            .map_err(|_| OAuthFlowError::IdentityProviderUnavailable)?;
+        if !response.status().is_success() {
+            return Err(OAuthFlowError::IdentityProviderUnavailable);
+        }
+        let body = response
+            .json::<GithubTokenResponse>()
+            .await
+            .map_err(|_| OAuthFlowError::IdentityProviderUnavailable)?;
+        let token = Zeroizing::new(body.access_token.unwrap_or_default());
+        if body.error.is_some() {
+            return Err(OAuthFlowError::CodeExchangeFailed);
+        }
+        if token.is_empty() {
+            return Err(OAuthFlowError::IdentityProviderUnavailable);
+        }
+        let scopes = body
+            .scope
+            .unwrap_or_default()
+            .split([',', ' '])
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok((token, scopes))
+    }
+
+    /// Resolve a GitHub OAuth token to a configured identity whose account
+    /// has two-factor authentication enabled.
     async fn github_account_from_token(
         &self,
         token: &str,
         granted_scopes: &[String],
-    ) -> Result<(String, GithubUserResponse), OAuthFlowError> {
+    ) -> Result<Account, OAuthFlowError> {
         if !scope_grants_read_user(granted_scopes) {
             return Err(OAuthFlowError::ScopeNotGranted);
         }
@@ -496,8 +499,7 @@ impl Authenticator {
             .resolve_github_user(token)
             .await
             .map_err(|error| match error {
-                AuthError::ClaimsDenied => OAuthFlowError::ClaimsDenied,
-                AuthError::InvalidToken => OAuthFlowError::TokenValidationFailed,
+                AuthError::InvalidToken => OAuthFlowError::CodeExchangeFailed,
                 _ => OAuthFlowError::IdentityProviderUnavailable,
             })?;
         let user_id = user.id.to_string();
@@ -513,46 +515,11 @@ impl Authenticator {
         if user.two_factor_authentication != Some(true) {
             return Err(OAuthFlowError::TwoFactorRequired);
         }
-        Ok((identity.id.clone(), user))
-    }
-
-    async fn check_github_oauth_token(&self, token: &str) -> Result<Vec<String>, OAuthFlowError> {
-        let github = &self.inner.github;
-        let response = self
-            .inner
-            .http
-            .post(format!(
-                "{}/applications/{}/token",
-                github.api_url, github.oauth_client_id
-            ))
-            .basic_auth(
-                &github.oauth_client_id,
-                Some(self.inner.github_oauth_client_secret.as_str()),
-            )
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", &github.api_version)
-            .json(&GithubTokenCheckRequest {
-                access_token: token,
-            })
-            .send()
-            .await
-            .map_err(|_| OAuthFlowError::IdentityProviderUnavailable)?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(OAuthFlowError::TokenValidationFailed);
-        }
-        if !response.status().is_success() {
-            return Err(OAuthFlowError::IdentityProviderUnavailable);
-        }
-
-        let checked = response
-            .json::<GithubTokenCheckResponse>()
-            .await
-            .map_err(|_| OAuthFlowError::IdentityProviderUnavailable)?;
-        if checked.app.client_id != github.oauth_client_id {
-            return Err(OAuthFlowError::TokenValidationFailed);
-        }
-        Ok(checked.scopes)
+        Ok(Account {
+            identity_id: identity.id.clone(),
+            user_id,
+            login: user.login,
+        })
     }
 
     async fn resolve_github_user(&self, token: &str) -> Result<GithubUserResponse, AuthError> {
@@ -579,7 +546,7 @@ impl Authenticator {
             .map_err(|_| AuthError::IdentityProviderUnavailable)
     }
 
-    /// Revoke a GitHub OAuth bootstrap token before minting a signer session.
+    /// Revoke the GitHub token before issuing anything signer-local.
     /// A 404 is also safe: GitHub is confirming that this app no longer has
     /// that token. Any other failure is fail-closed.
     async fn revoke_github_token(&self, token: &str) -> Result<(), OAuthFlowError> {
@@ -804,43 +771,37 @@ impl Authenticator {
 #[cfg(test)]
 impl Authenticator {
     pub(crate) fn for_tests() -> Self {
-        Self::for_tests_with_github("https://api.github.com", Vec::new())
+        Self::for_tests_with_github(
+            "https://api.github.com",
+            "https://signer.example.com",
+            Vec::new(),
+        )
     }
 
-    fn for_tests_with_github(api_url: &str, identities: Vec<IdentityConfig>) -> Self {
+    /// `github_url` stands in for both github.com and api.github.com.
+    pub(crate) fn for_tests_with_github(
+        github_url: &str,
+        public_url: &str,
+        identities: Vec<IdentityConfig>,
+    ) -> Self {
         let github: GithubConfig = toml::from_str(&format!(
-            r#"APIURL = "{api_url}"
+            r#"APIURL = "{github_url}"
+OAuthAuthorizeURL = "{github_url}/login/oauth/authorize"
+OAuthAccessTokenURL = "{github_url}/login/oauth/access_token"
 OAuthClientID = "Iv1.test"
 "#
         ))
         .expect("test GitHub config");
         let actions: GithubActionsConfig = toml::from_str("").expect("test Actions config");
-        Self {
-            inner: Arc::new(Inner {
-                github,
-                github_oauth_client_secret: Zeroizing::new("secret".into()),
-                actions,
-                identities,
-                http: reqwest::Client::new(),
-                jwks: RwLock::new(JwksCache::default()),
-                jwks_refresh: AsyncMutex::new(()),
-                device_token_replay: Mutex::new(DeviceTokenReplay::default()),
-                oauth_sessions: RwLock::new(HashMap::new()),
-                seen_jtis: Mutex::new(HashMap::new()),
-            }),
-        }
+        Self::assemble(
+            public_url,
+            github,
+            Zeroizing::new("secret".into()),
+            actions,
+            identities,
+            reqwest::Client::new(),
+        )
     }
-}
-
-/// Fill a fixed-size buffer from the operating system CSPRNG.
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut bytes = [0_u8; N];
-    getrandom::fill(&mut bytes).expect("operating system random number generator failed");
-    bytes
-}
-
-fn session_key(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
 }
 
 fn unix_now() -> u64 {
@@ -999,91 +960,47 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc as StdArc,
-        atomic::{AtomicUsize, Ordering},
+    use axum::http::StatusCode;
+
+    use crate::{
+        oauth::{ACCESS_TOKEN_PREFIX, REFRESH_TOKEN_PREFIX},
+        test_github::{MockGithub, code_for_authorize_url, query_param},
     };
 
-    use axum::{
-        Json, Router,
-        extract::State,
-        http::StatusCode,
-        response::{IntoResponse, Response},
-        routing::{get, post},
-    };
-    use serde_json::json;
+    const PUBLIC_URL: &str = "https://signer.example.com";
+    const CLI_REDIRECT_URI: &str = "http://127.0.0.1:49152/callback";
+    const CLI_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CLI_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
-    #[derive(Clone)]
-    struct MockGithubState {
-        check_status: StatusCode,
-        token_client_id: String,
-        scopes: Vec<String>,
-        user_status: StatusCode,
-        user_id: u64,
-        login: String,
-        two_factor_authentication: Option<bool>,
-        revoke_status: StatusCode,
-        revocations: StdArc<AtomicUsize>,
+    fn cli_request() -> AuthorizationRequest {
+        AuthorizationRequest::new(CLI_REDIRECT_URI, "cli-state", CLI_CHALLENGE).unwrap()
     }
 
-    impl Default for MockGithubState {
-        fn default() -> Self {
-            Self {
-                check_status: StatusCode::OK,
-                token_client_id: "Iv1.test".into(),
-                scopes: vec!["read:user".into()],
-                user_status: StatusCode::OK,
-                user_id: 42,
-                login: "octocat".into(),
-                two_factor_authentication: Some(true),
-                revoke_status: StatusCode::NO_CONTENT,
-                revocations: StdArc::new(AtomicUsize::new(0)),
-            }
-        }
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        headers
     }
 
-    async fn mock_token_check(State(state): State<MockGithubState>) -> Response {
-        if state.check_status != StatusCode::OK {
-            return state.check_status.into_response();
-        }
-        Json(json!({
-            "scopes": state.scopes,
-            "app": { "client_id": state.token_client_id },
-        }))
-        .into_response()
-    }
-
-    async fn mock_user(State(state): State<MockGithubState>) -> Response {
-        if state.user_status != StatusCode::OK {
-            return state.user_status.into_response();
-        }
-        Json(json!({
-            "login": state.login,
-            "id": state.user_id,
-            "two_factor_authentication": state.two_factor_authentication,
-        }))
-        .into_response()
-    }
-
-    async fn mock_revoke(State(state): State<MockGithubState>) -> Response {
-        state.revocations.fetch_add(1, Ordering::SeqCst);
-        state.revoke_status.into_response()
-    }
-
-    async fn spawn_mock_github(state: MockGithubState) -> (String, tokio::task::JoinHandle<()>) {
-        let app = Router::new()
-            .route(
-                "/applications/{client_id}/token",
-                post(mock_token_check).delete(mock_revoke),
-            )
-            .route("/user", get(mock_user))
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), task)
+    /// Drive the server side of a login up to the point where GitHub has
+    /// redirected the browser back to the signer.
+    async fn github_login(
+        github: MockGithub,
+    ) -> (
+        Authenticator,
+        Result<(String, Account), OAuthFlowError>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (github_url, task) = github.spawn().await;
+        let auth =
+            Authenticator::for_tests_with_github(&github_url, PUBLIC_URL, vec![account_identity()]);
+        let authorize_url = auth.begin_github_login(cli_request()).unwrap();
+        let state = query_param(&authorize_url, "state").unwrap();
+        let pending = auth.take_pending_login(&state).unwrap();
+        let outcome = auth
+            .finish_github_login(&pending, &code_for_authorize_url(&authorize_url))
+            .await;
+        (auth, outcome, task)
     }
 
     fn account_identity() -> IdentityConfig {
@@ -1207,19 +1124,31 @@ mod tests {
     }
 
     #[test]
-    fn oauth_device_config_exposes_only_public_flow_parameters() {
+    fn github_authorize_url_carries_the_confidential_client_parameters() {
         let auth = test_authenticator();
-        let config = auth.github_oauth_device_config();
-        assert_eq!(config.client_id, "Iv1.test");
-        assert_eq!(
-            config.device_code_url,
-            "https://github.com/login/device/code"
+        let url = auth.begin_github_login(cli_request()).unwrap();
+        assert!(
+            url.as_str()
+                .starts_with("https://api.github.com/login/oauth/authorize?")
         );
+        assert_eq!(query_param(&url, "client_id").as_deref(), Some("Iv1.test"));
         assert_eq!(
-            config.access_token_url,
-            "https://github.com/login/oauth/access_token"
+            query_param(&url, "redirect_uri").as_deref(),
+            Some("https://signer.example.com/v1/auth/github/callback")
         );
-        assert_eq!(config.scope, "read:user");
+        assert_eq!(query_param(&url, "scope").as_deref(), Some("read:user"));
+        assert_eq!(
+            query_param(&url, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+        // GitHub's leg has its own state and PKCE pair: the CLI's values and
+        // the client secret never appear in the browser's GitHub URL.
+        assert_ne!(query_param(&url, "state").as_deref(), Some("cli-state"));
+        assert_ne!(
+            query_param(&url, "code_challenge").as_deref(),
+            Some(CLI_CHALLENGE)
+        );
+        assert!(!url.as_str().contains("secret"));
     }
 
     #[test]
@@ -1230,198 +1159,157 @@ mod tests {
         assert!(!scope_grants_read_user(&["read:org".into()]));
     }
 
-    #[test]
-    fn device_bootstrap_tokens_are_single_use() {
-        let auth = test_authenticator();
-        let first = auth.begin_device_token_use("gho_test").unwrap();
-        assert!(matches!(
-            auth.begin_device_token_use("gho_test"),
-            Err(OAuthFlowError::TokenReplayed)
-        ));
-        first.mark_consumed().unwrap();
-        drop(first);
-        assert!(matches!(
-            auth.begin_device_token_use("gho_test"),
-            Err(OAuthFlowError::TokenReplayed)
-        ));
-    }
-
     #[tokio::test]
-    async fn device_exchange_mints_session_only_after_successful_revocation() {
-        let state = MockGithubState::default();
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
+    async fn login_issues_tokens_only_after_revoking_the_github_token() {
+        let github = MockGithub::default();
+        let (auth, outcome, task) = github_login(github.clone()).await;
+        let (code, account) = outcome.unwrap();
+        assert_eq!(account.identity_id, "maintainer");
+        assert_eq!(github.exchanges(), 1);
+        assert_eq!(github.revocations(), 1);
 
-        let grant = auth
-            .complete_github_device_oauth("gho_valid")
+        let (tokens, _) = auth
+            .redeem_authorization_code(&code, CLI_REDIRECT_URI, CLI_VERIFIER)
+            .unwrap();
+        assert!(tokens.access_token.starts_with(ACCESS_TOKEN_PREFIX));
+        let refresh_token = tokens.refresh_token.unwrap();
+        assert!(refresh_token.starts_with(REFRESH_TOKEN_PREFIX));
+
+        let principal = auth
+            .authenticate(&bearer(&tokens.access_token))
             .await
             .unwrap();
-        assert!(grant.access_token.starts_with(SESSION_TOKEN_PREFIX));
-        assert_eq!(revocations.load(Ordering::SeqCst), 1);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            format!("Bearer {}", grant.access_token).parse().unwrap(),
-        );
-        let principal = auth.authenticate(&headers).await.unwrap();
         assert_eq!(principal.identity_id, "maintainer");
+        assert_eq!(principal.principal_key, "github-account:42");
+        assert_eq!(principal.auth_method, "github-oauth-session");
+
+        // Refreshing is local: GitHub is not contacted again.
+        let (refreshed, _) = auth.refresh_session(&refresh_token).unwrap();
+        assert!(
+            auth.authenticate(&bearer(&refreshed.access_token))
+                .await
+                .is_ok()
+        );
+        assert_eq!(github.exchanges(), 1);
+
+        // A refresh token is not a bearer credential for the signing API.
         assert!(matches!(
-            auth.complete_github_device_oauth("gho_valid").await,
-            Err(OAuthFlowError::TokenReplayed)
+            auth.authenticate(&bearer(&refresh_token)).await,
+            Err(AuthError::InvalidToken)
+        ));
+
+        assert!(auth.revoke_session(&refreshed.access_token).is_some());
+        assert!(matches!(
+            auth.authenticate(&bearer(&refreshed.access_token)).await,
+            Err(AuthError::InvalidToken)
         ));
         task.abort();
     }
 
     #[tokio::test]
-    async fn device_exchange_rejects_token_for_another_oauth_app() {
-        let state = MockGithubState {
-            token_client_id: "Iv1.someone-else".into(),
-            ..MockGithubState::default()
+    async fn github_state_is_single_use() {
+        let auth = test_authenticator();
+        let url = auth.begin_github_login(cli_request()).unwrap();
+        let state = query_param(&url, "state").unwrap();
+        assert!(auth.take_pending_login(&state).is_some());
+        assert!(auth.take_pending_login(&state).is_none());
+        assert!(auth.take_pending_login("forged").is_none());
+    }
+
+    #[tokio::test]
+    async fn login_rejects_a_code_github_does_not_accept() {
+        let github = MockGithub::default();
+        let (github_url, task) = github.clone().spawn().await;
+        let auth =
+            Authenticator::for_tests_with_github(&github_url, PUBLIC_URL, vec![account_identity()]);
+        let url = auth.begin_github_login(cli_request()).unwrap();
+        let pending = auth
+            .take_pending_login(&query_param(&url, "state").unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            auth.finish_github_login(&pending, "ghcode_forged").await,
+            Err(OAuthFlowError::CodeExchangeFailed)
+        ));
+        assert_eq!(github.revocations(), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn login_revokes_token_when_scope_is_missing() {
+        let github = MockGithub {
+            scope: "read:org".into(),
+            ..MockGithub::default()
         };
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
-
-        assert!(matches!(
-            auth.complete_github_device_oauth("gho_wrong_app").await,
-            Err(OAuthFlowError::TokenValidationFailed)
-        ));
-        assert_eq!(revocations.load(Ordering::SeqCst), 0);
+        let (_auth, outcome, task) = github_login(github.clone()).await;
+        assert!(matches!(outcome, Err(OAuthFlowError::ScopeNotGranted)));
+        assert_eq!(github.revocations(), 1);
         task.abort();
     }
 
     #[tokio::test]
-    async fn device_exchange_revokes_token_when_scope_is_missing() {
-        let state = MockGithubState {
-            scopes: vec!["read:org".into()],
-            ..MockGithubState::default()
-        };
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
-
-        assert!(matches!(
-            auth.complete_github_device_oauth("gho_no_scope").await,
-            Err(OAuthFlowError::ScopeNotGranted)
-        ));
-        assert_eq!(revocations.load(Ordering::SeqCst), 1);
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn device_exchange_revokes_token_for_unauthorized_account() {
-        let state = MockGithubState {
+    async fn login_revokes_token_for_unauthorized_account() {
+        let github = MockGithub {
             user_id: 99,
-            ..MockGithubState::default()
+            ..MockGithub::default()
         };
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
-
-        assert!(matches!(
-            auth.complete_github_device_oauth("gho_unauthorized").await,
-            Err(OAuthFlowError::ClaimsDenied)
-        ));
-        assert_eq!(revocations.load(Ordering::SeqCst), 1);
+        let (_auth, outcome, task) = github_login(github.clone()).await;
+        assert!(matches!(outcome, Err(OAuthFlowError::ClaimsDenied)));
+        assert_eq!(github.revocations(), 1);
         task.abort();
     }
 
     #[tokio::test]
-    async fn device_exchange_requires_two_factor_authentication() {
-        let state = MockGithubState {
-            two_factor_authentication: Some(false),
-            ..MockGithubState::default()
-        };
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
-
-        assert!(matches!(
-            auth.complete_github_device_oauth("gho_no_2fa").await,
-            Err(OAuthFlowError::TwoFactorRequired)
-        ));
-        assert_eq!(revocations.load(Ordering::SeqCst), 1);
-        task.abort();
+    async fn login_requires_two_factor_authentication() {
+        for two_factor_authentication in [Some(false), None] {
+            let github = MockGithub {
+                two_factor_authentication,
+                ..MockGithub::default()
+            };
+            let (_auth, outcome, task) = github_login(github.clone()).await;
+            assert!(matches!(outcome, Err(OAuthFlowError::TwoFactorRequired)));
+            assert_eq!(github.revocations(), 1);
+            task.abort();
+        }
     }
 
     #[tokio::test]
-    async fn device_exchange_handles_github_token_check_failure() {
-        let state = MockGithubState {
-            check_status: StatusCode::INTERNAL_SERVER_ERROR,
-            ..MockGithubState::default()
+    async fn login_handles_github_code_exchange_outage() {
+        let github = MockGithub {
+            exchange_status: StatusCode::INTERNAL_SERVER_ERROR,
+            ..MockGithub::default()
         };
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
-
+        let (_auth, outcome, task) = github_login(github.clone()).await;
         assert!(matches!(
-            auth.complete_github_device_oauth("gho_github_failure")
-                .await,
+            outcome,
             Err(OAuthFlowError::IdentityProviderUnavailable)
         ));
-        assert_eq!(revocations.load(Ordering::SeqCst), 0);
+        assert_eq!(github.revocations(), 0);
         task.abort();
     }
 
     #[tokio::test]
-    async fn device_exchange_fails_closed_when_revocation_fails() {
-        let state = MockGithubState {
+    async fn login_fails_closed_when_revocation_fails() {
+        let github = MockGithub {
             revoke_status: StatusCode::INTERNAL_SERVER_ERROR,
-            ..MockGithubState::default()
+            ..MockGithub::default()
         };
-        let revocations = state.revocations.clone();
-        let (api_url, task) = spawn_mock_github(state).await;
-        let auth = Authenticator::for_tests_with_github(&api_url, vec![account_identity()]);
-
+        let (_auth, outcome, task) = github_login(github.clone()).await;
         assert!(matches!(
-            auth.complete_github_device_oauth("gho_revoke_failure")
-                .await,
+            outcome,
             Err(OAuthFlowError::TokenRevocationFailed)
         ));
-        assert!(auth.inner.oauth_sessions.read().await.is_empty());
-
-        // A transient revocation failure must not poison the retained replay
-        // cache: a later request may retry the fail-closed revocation step.
-        assert!(matches!(
-            auth.complete_github_device_oauth("gho_revoke_failure")
-                .await,
-            Err(OAuthFlowError::TokenRevocationFailed)
-        ));
-        assert_eq!(revocations.load(Ordering::SeqCst), 2);
+        assert_eq!(github.revocations(), 1);
         task.abort();
     }
 
     #[tokio::test]
-    async fn session_tokens_are_random_and_stored_hashed() {
+    async fn github_tokens_are_not_accepted_as_bearer_credentials() {
         let auth = test_authenticator();
-        let token = format!(
-            "{SESSION_TOKEN_PREFIX}{}",
-            B64URL.encode(random_bytes::<32>())
-        );
-        assert_eq!(token.len(), 4 + 43);
-        auth.inner.oauth_sessions.write().await.insert(
-            session_key(&token),
-            GithubAccountSession {
-                expires_at: Instant::now() + Duration::from_secs(60),
-                identity_id: "maintainer".into(),
-                user_id: "42".into(),
-                login: "octocat".into(),
-            },
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
-        assert!(auth.authenticate(&headers).await.is_ok());
-        assert!(
-            !auth
-                .inner
-                .oauth_sessions
-                .read()
-                .await
-                .keys()
-                .any(|key| key.as_slice() == token.as_bytes())
-        );
+        assert!(matches!(
+            auth.authenticate(&bearer("gho_mock")).await,
+            Err(AuthError::InvalidToken)
+        ));
     }
 
     #[test]
