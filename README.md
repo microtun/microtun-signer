@@ -251,15 +251,14 @@ cargo test --all-targets --locked
 
 ## License
 
-Microtun is **source-available software**, not open-source software.
+Microtun is **dual-licensed**:
 
-The source code is made available for transparency, inspection, security research, auditing, and evaluation. You may:
-
-- View and inspect the source code.
-- Make reasonable copies for testing, auditing, evaluation, or security research.
-- Compile, run, and modify the software as reasonably necessary for evaluation.
-- Evaluate the software for up to **60 days** from the first time you compile or run it for a particular evaluation.
-
-The license does **not** permit production, operational, or commercial use. You may not use Microtun to provide products or services, incorporate it into another product or service, commercially exploit it, or distribute modified versions except where expressly permitted by the license.
-
-See [`LICENSE`](LICENSE) for the complete terms.
+- **Noncommercial license:** [PolyForm Noncommercial License 1.0.0](LICENSE). 
+  You may use, modify, and distribute
+  Microtun for purposes permitted by that license, including its provisions
+  for qualifying noncommercial organizations. This is a source-available
+  license, **not an open-source license**.
+- **Commercial license:** A separate written commercial license is
+  **available upon request**. Commercial rights are granted only under a 
+  separately agreed commercial license, not by the 
+  PolyForm Noncommercial License or merely by making a request.
