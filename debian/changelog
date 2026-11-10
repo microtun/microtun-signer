@@ -1,14 +1,15 @@
-microtun-signer (0.11.0) UNRELEASED; urgency=medium
+microtun-signer (0.12.0) UNRELEASED; urgency=medium
+
+  * Replace the GitHub device flow with the OAuth authorization code flow
+    (PKCE, loopback redirect). 
+
+ -- Damian Peckett <damian@pecke.tt>  Tue, 10 Nov 2026 23:12:16 +0100
+
+microtun-signer (0.11.0) unstable; urgency=medium
 
   * Add keyring support 
-  * Replace the GitHub device flow with the OAuth authorization code flow
-    (PKCE, loopback redirect) and add rotating refresh tokens. Requires
-    Server.PublicURL and a callback URL on the GitHub OAuth App.
-  * Keep the CLI session in the OS credential store, with the private file
-    as fallback.
-  * Rate-limit sign-ins per client address (Server.ClientIPHeader).
 
- -- Damian Peckett <damian@pecke.tt>  Sat, 24 Oct 2026 16:55:53 +0200
+ -- Damian Peckett <damian@pecke.tt>  Tue, 10 Nov 2026 23:10:25 +0100
 
 microtun-signer (0.10.1) unstable; urgency=medium
 
