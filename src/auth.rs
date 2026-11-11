@@ -45,6 +45,7 @@ const OAUTH_SCOPE: &str = "read:user";
 /// Path below `Server.PublicURL` that GitHub redirects users back to. It must
 /// be registered as the OAuth App's authorization callback URL.
 pub const GITHUB_CALLBACK_PATH: &str = "/v1/auth/github/callback";
+pub const AUTHORIZE_PATH: &str = "/v1/auth/authorize";
 
 #[derive(Clone)]
 pub struct Authenticator {
@@ -56,6 +57,14 @@ struct Inner {
     github_oauth_client_secret: Zeroizing<String>,
     /// `<Server.PublicURL>/v1/auth/github/callback`.
     github_redirect_uri: String,
+    /// `<Server.PublicURL>/v1/auth/authorize`: where the confirmation page
+    /// posts back to.
+    authorize_endpoint: String,
+    /// Scheme, host and port of `Server.PublicURL`, as browsers report it in
+    /// the `Origin` header.
+    public_origin: String,
+    /// False only for an `http://` loopback `Server.PublicURL`.
+    public_url_is_https: bool,
     actions: GithubActionsConfig,
     identities: Vec<IdentityConfig>,
     http: reqwest::Client,
@@ -278,11 +287,21 @@ impl Authenticator {
             (github.oauth_refresh_ttl_seconds != 0)
                 .then(|| Duration::from_secs(github.oauth_refresh_ttl_seconds)),
         );
+        // Configuration validation guarantees an http(s) URL with a host.
+        let parsed_public_url = reqwest::Url::parse(public_url).ok();
+        let public_origin = parsed_public_url
+            .as_ref()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        let public_url_is_https = parsed_public_url.is_none_or(|url| url.scheme() == "https");
         Self {
             inner: Arc::new(Inner {
                 github,
                 github_oauth_client_secret,
                 github_redirect_uri: format!("{public_url}{GITHUB_CALLBACK_PATH}"),
+                authorize_endpoint: format!("{public_url}{AUTHORIZE_PATH}"),
+                public_origin,
+                public_url_is_https,
                 actions,
                 identities,
                 http,
@@ -294,11 +313,27 @@ impl Authenticator {
         }
     }
 
-    /// Start a login for a validated CLI authorization request and return the
-    /// GitHub URL the user's browser must be sent to.
+    /// Absolute URL of the signer's own authorization endpoint.
+    pub fn authorize_endpoint(&self) -> &str {
+        &self.inner.authorize_endpoint
+    }
+
+    /// The origin browsers name when a page of this signer submits a form.
+    pub fn public_origin(&self) -> &str {
+        &self.inner.public_origin
+    }
+
+    pub fn public_url_is_https(&self) -> bool {
+        self.inner.public_url_is_https
+    }
+
+    /// Start a login for a validated CLI authorization request that the user
+    /// confirmed in the browser holding `browser_token`, and return the
+    /// GitHub URL that browser must be sent to.
     pub fn begin_github_login(
         &self,
         request: AuthorizationRequest,
+        browser_token: &str,
     ) -> Result<reqwest::Url, OAuthFlowError> {
         let github = &self.inner.github;
         let mut url = reqwest::Url::parse(&github.oauth_authorize_url)
@@ -306,7 +341,7 @@ impl Authenticator {
         let (state, code_challenge) = self
             .inner
             .oauth
-            .begin_login(request)
+            .begin_login(request, browser_token)
             .map_err(|_| OAuthFlowError::Capacity)?;
         url.query_pairs_mut()
             .append_pair("client_id", &github.oauth_client_id)
@@ -971,6 +1006,7 @@ mod tests {
     const CLI_REDIRECT_URI: &str = "http://127.0.0.1:49152/callback";
     const CLI_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CLI_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const BROWSER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn cli_request() -> AuthorizationRequest {
         AuthorizationRequest::new(CLI_REDIRECT_URI, "cli-state", CLI_CHALLENGE).unwrap()
@@ -994,7 +1030,9 @@ mod tests {
         let (github_url, task) = github.spawn().await;
         let auth =
             Authenticator::for_tests_with_github(&github_url, PUBLIC_URL, vec![account_identity()]);
-        let authorize_url = auth.begin_github_login(cli_request()).unwrap();
+        let authorize_url = auth
+            .begin_github_login(cli_request(), BROWSER_TOKEN)
+            .unwrap();
         let state = query_param(&authorize_url, "state").unwrap();
         let pending = auth.take_pending_login(&state).unwrap();
         let outcome = auth
@@ -1126,7 +1164,9 @@ mod tests {
     #[test]
     fn github_authorize_url_carries_the_confidential_client_parameters() {
         let auth = test_authenticator();
-        let url = auth.begin_github_login(cli_request()).unwrap();
+        let url = auth
+            .begin_github_login(cli_request(), BROWSER_TOKEN)
+            .unwrap();
         assert!(
             url.as_str()
                 .starts_with("https://api.github.com/login/oauth/authorize?")
@@ -1149,6 +1189,29 @@ mod tests {
             Some(CLI_CHALLENGE)
         );
         assert!(!url.as_str().contains("secret"));
+    }
+
+    #[test]
+    fn public_url_yields_the_origin_and_form_target() {
+        let auth = Authenticator::for_tests_with_github(
+            "https://api.github.com",
+            "https://signer.example.com/prefix",
+            Vec::new(),
+        );
+        assert_eq!(auth.public_origin(), "https://signer.example.com");
+        assert_eq!(
+            auth.authorize_endpoint(),
+            "https://signer.example.com/prefix/v1/auth/authorize"
+        );
+        assert!(auth.public_url_is_https());
+
+        let local = Authenticator::for_tests_with_github(
+            "https://api.github.com",
+            "http://127.0.0.1:8080",
+            Vec::new(),
+        );
+        assert_eq!(local.public_origin(), "http://127.0.0.1:8080");
+        assert!(!local.public_url_is_https());
     }
 
     #[test]
@@ -1209,9 +1272,13 @@ mod tests {
     #[tokio::test]
     async fn github_state_is_single_use() {
         let auth = test_authenticator();
-        let url = auth.begin_github_login(cli_request()).unwrap();
+        let url = auth
+            .begin_github_login(cli_request(), BROWSER_TOKEN)
+            .unwrap();
         let state = query_param(&url, "state").unwrap();
-        assert!(auth.take_pending_login(&state).is_some());
+        let pending = auth.take_pending_login(&state).unwrap();
+        assert!(pending.confirmed_by(BROWSER_TOKEN));
+        assert!(!pending.confirmed_by("BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(auth.take_pending_login(&state).is_none());
         assert!(auth.take_pending_login("forged").is_none());
     }
@@ -1222,7 +1289,9 @@ mod tests {
         let (github_url, task) = github.clone().spawn().await;
         let auth =
             Authenticator::for_tests_with_github(&github_url, PUBLIC_URL, vec![account_identity()]);
-        let url = auth.begin_github_login(cli_request()).unwrap();
+        let url = auth
+            .begin_github_login(cli_request(), BROWSER_TOKEN)
+            .unwrap();
         let pending = auth
             .take_pending_login(&query_param(&url, "state").unwrap())
             .unwrap();

@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::{
-    oauth::CLI_CLIENT_ID,
+    oauth::{CLI_CLIENT_ID, verification_code},
     session_cache::{CachedSession, SessionCache, Stored},
     valid_key_id,
 };
@@ -549,6 +549,8 @@ async fn github_browser_login(
     let oauth = signer_oauth_client(signer_base_url)?.set_redirect_uri(redirect_uri);
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    // The signer's confirmation page derives the same code from the challenge.
+    let verification_code = verification_code(pkce_challenge.as_str());
     let (authorize_url, state) = oauth
         .authorize_url(CsrfToken::new_random)
         .set_pkce_challenge(pkce_challenge)
@@ -557,6 +559,10 @@ async fn github_browser_login(
     eprintln!("GitHub sign-in required. Open this URL in a browser on this machine:");
     eprintln!();
     eprintln!("  {authorize_url}");
+    eprintln!();
+    eprintln!("The page shows a verification code. Continue there only if it is:");
+    eprintln!();
+    eprintln!("  {verification_code}");
     eprintln!();
     eprintln!("Waiting for the sign-in to complete...");
     open_browser(&authorize_url);
@@ -801,8 +807,17 @@ mod tests {
             revoke_token, signer_base_url,
         };
         use crate::{
-            api::AppState, auth::Authenticator, authorization::Authorizer, config::IdentityConfig,
-            key::KeyStore, session_cache::SessionCache, test_github::MockGithub,
+            api::AppState,
+            auth::Authenticator,
+            authorization::Authorizer,
+            config::IdentityConfig,
+            key::KeyStore,
+            oauth::verification_code,
+            session_cache::SessionCache,
+            test_github::{
+                MockGithub, browser_client, browser_sign_in, follow_redirects,
+                open_confirmation_page, submit_confirmation,
+            },
         };
 
         struct Signer {
@@ -859,15 +874,36 @@ mod tests {
             }
         }
 
-        /// Stands in for the user's browser: follows the redirect chain
-        /// signer -> GitHub -> signer -> CLI loopback listener.
+        /// Stands in for the user at their browser: confirms on the signer's
+        /// page and follows signer -> GitHub -> signer -> CLI loopback
+        /// listener.
         fn browser(url: &reqwest::Url) {
             let url = url.clone();
             tokio::spawn(async move {
-                let page = reqwest::Client::new().get(url).send().await.unwrap();
+                let page = browser_sign_in(&url).await;
                 assert_eq!(page.url().host_str(), Some("127.0.0.1"));
                 assert_eq!(page.url().path(), "/callback");
             });
+        }
+
+        /// A well-formed authorization URL, as the CLI (or anyone) builds it.
+        fn authorize_url(signer: &Signer, redirect_uri: &str, client_id: &str) -> reqwest::Url {
+            let mut url = signer.base_url.join("v1/auth/authorize").unwrap();
+            url.query_pairs_mut()
+                .append_pair("response_type", "code")
+                .append_pair("client_id", client_id)
+                .append_pair("redirect_uri", redirect_uri)
+                .append_pair("state", "s")
+                .append_pair("code_challenge", CHALLENGE)
+                .append_pair("code_challenge_method", "S256");
+            url
+        }
+
+        const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        const LOOPBACK: &str = "http://127.0.0.1:4000/callback";
+
+        fn origin(signer: &Signer) -> String {
+            signer.base_url.origin().ascii_serialization()
         }
 
         async fn accepted(auth: &Authenticator, access_token: &str) -> bool {
@@ -1175,42 +1211,51 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn authorize_endpoint_only_redirects_for_wellformed_requests() {
+        async fn authorize_endpoint_shows_a_confirmation_page_and_starts_nothing() {
             let signer = spawn_signer(MockGithub::default()).await;
             let client = public_api_client().unwrap();
-            let authorize = |redirect_uri: &str, client_id: &str| {
-                let mut url = signer.base_url.join("v1/auth/authorize").unwrap();
-                url.query_pairs_mut()
-                    .append_pair("response_type", "code")
-                    .append_pair("client_id", client_id)
-                    .append_pair("redirect_uri", redirect_uri)
-                    .append_pair("state", "s")
-                    .append_pair(
-                        "code_challenge",
-                        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-                    )
-                    .append_pair("code_challenge_method", "S256");
-                client.get(url).send()
-            };
 
-            let response = authorize("http://127.0.0.1:4000/callback", "microtun-signer-cli")
+            let response = client
+                .get(authorize_url(&signer, LOOPBACK, "microtun-signer-cli"))
+                .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::FOUND);
+            // No redirect: GitHub is not involved until the person confirms.
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers().clone();
+            assert!(headers.get("location").is_none());
             assert!(
-                response.headers()["location"]
+                headers["content-type"]
                     .to_str()
                     .unwrap()
-                    .contains("/login/oauth/authorize?client_id=Iv1.test")
+                    .starts_with("text/html")
             );
+            assert_eq!(headers["cache-control"], "no-store");
+            assert_eq!(headers["x-frame-options"], "DENY");
+            // `no-referrer` would make browsers submit the form as Origin: null.
+            assert_eq!(headers["referrer-policy"], "same-origin");
+            let csp = headers["content-security-policy"].to_str().unwrap();
+            assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+            let cookie = headers["set-cookie"].to_str().unwrap();
+            assert!(cookie.starts_with("mts-login="), "{cookie}");
+            assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"));
+
+            let html = response.text().await.unwrap();
+            assert!(html.contains(&verification_code(CHALLENGE)), "{html}");
+            assert!(html.contains("127.0.0.1:4000"));
 
             for (redirect_uri, client_id) in [
                 ("https://evil.example/callback", "microtun-signer-cli"),
-                ("http://127.0.0.1:4000/callback", "someone-else"),
+                (LOOPBACK, "someone-else"),
             ] {
-                let response = authorize(redirect_uri, client_id).await.unwrap();
+                let response = client
+                    .get(authorize_url(&signer, redirect_uri, client_id))
+                    .send()
+                    .await
+                    .unwrap();
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
                 assert!(response.headers().get("location").is_none());
+                assert!(response.headers().get("set-cookie").is_none());
             }
 
             // A callback nobody started is answered without contacting GitHub.
@@ -1221,6 +1266,129 @@ mod tests {
                 .append_pair("state", "forged");
             let response = client.get(callback).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(signer.github.exchanges(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_second_tab_keeps_the_browsers_login_cookie() {
+            let signer = spawn_signer(MockGithub::default()).await;
+            let url = authorize_url(&signer, LOOPBACK, "microtun-signer-cli");
+            let first = open_confirmation_page(&url).await;
+            let second = browser_client()
+                .get(url)
+                .header("cookie", &first.cookie)
+                .send()
+                .await
+                .unwrap();
+            let reissued = second.headers()["set-cookie"].to_str().unwrap();
+            assert!(
+                reissued.starts_with(&format!("{};", first.cookie)),
+                "{reissued}"
+            );
+            // So the form in the first tab still works.
+            let submitted =
+                submit_confirmation(&first, Some(&first.cookie), Some(&origin(&signer))).await;
+            assert_eq!(submitted.status(), StatusCode::SEE_OTHER);
+        }
+
+        #[tokio::test]
+        async fn confirmation_is_only_accepted_from_the_signers_own_page() {
+            let signer = spawn_signer(MockGithub::default()).await;
+            let url = authorize_url(&signer, LOOPBACK, "microtun-signer-cli");
+            let page = open_confirmation_page(&url).await;
+            let origin = origin(&signer);
+            let other_browser = open_confirmation_page(&url).await;
+            assert_ne!(page.cookie, other_browser.cookie);
+
+            for (cookie, request_origin) in [
+                // Another site submitting the form in the victim's browser.
+                (Some(page.cookie.as_str()), Some("https://evil.example")),
+                (Some(page.cookie.as_str()), Some("null")),
+                // No Origin header at all: not a browser form submission.
+                (Some(page.cookie.as_str()), None),
+                // A form that was served to a different browser.
+                (None, Some(origin.as_str())),
+                (Some(other_browser.cookie.as_str()), Some(origin.as_str())),
+                (Some("mts-login=garbage"), Some(origin.as_str())),
+            ] {
+                let response = submit_confirmation(&page, cookie, request_origin).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{cookie:?} {request_origin:?}"
+                );
+                assert!(response.headers().get("location").is_none());
+            }
+
+            // The redirect URI is validated again when the form comes back.
+            let mut tampered = open_confirmation_page(&url).await;
+            for (name, value) in &mut tampered.fields {
+                if name == "redirect_uri" {
+                    *value = "https://evil.example/callback".into();
+                }
+            }
+            let response =
+                submit_confirmation(&tampered, Some(&tampered.cookie), Some(&origin)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response.headers().get("location").is_none());
+
+            // The real thing goes to GitHub, carrying none of the CLI's values.
+            let response = submit_confirmation(&page, Some(&page.cookie), Some(&origin)).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let location = response.headers()["location"].to_str().unwrap();
+            assert!(
+                location.contains("/login/oauth/authorize?client_id=Iv1.test"),
+                "{location}"
+            );
+            assert!(!location.contains(CHALLENGE));
+            assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        }
+
+        /// The attacker confirms in their own browser and sends the victim
+        /// the resulting GitHub link. GitHub does not prompt, so the victim's
+        /// browser arrives at the callback with a valid state - but without
+        /// the cookie of the browser that confirmed.
+        #[tokio::test]
+        async fn github_link_prepared_in_another_browser_is_refused() {
+            let signer = spawn_signer(MockGithub::default()).await;
+            let origin = origin(&signer);
+            let url = authorize_url(&signer, LOOPBACK, "microtun-signer-cli");
+
+            for victim_cookie in [
+                None,
+                Some("mts-login=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ] {
+                let attacker = open_confirmation_page(&url).await;
+                let to_github =
+                    submit_confirmation(&attacker, Some(&attacker.cookie), Some(&origin)).await;
+                assert_eq!(to_github.status(), StatusCode::SEE_OTHER);
+
+                let page = follow_redirects(to_github, &origin, victim_cookie).await;
+                assert_eq!(page.status(), StatusCode::FORBIDDEN);
+                // It ended at the signer, not at the attacker's loopback port.
+                assert_eq!(page.url().path(), "/v1/auth/github/callback");
+                assert!(page.headers().get("location").is_none());
+                assert!(
+                    page.text()
+                        .await
+                        .unwrap()
+                        .contains("not started in this browser")
+                );
+            }
+            // GitHub's code was never exchanged, and no session exists.
+            assert_eq!(signer.github.exchanges(), 0);
+        }
+
+        /// The attacker sends the victim the signer's own authorization link.
+        /// Opening it does nothing by itself any more.
+        #[tokio::test]
+        async fn opening_a_sign_in_link_without_confirming_starts_no_login() {
+            let signer = spawn_signer(MockGithub::default()).await;
+            let url = authorize_url(&signer, LOOPBACK, "microtun-signer-cli");
+            let response = reqwest::Client::new().get(url).send().await.unwrap();
+            // A redirect-following client stays on the signer's page.
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.url().path(), "/v1/auth/authorize");
             assert_eq!(signer.github.exchanges(), 0);
         }
     }

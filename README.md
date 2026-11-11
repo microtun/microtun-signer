@@ -139,18 +139,30 @@ in a keyring can still be unlocked with `--key-id`.
   --digest "$DIGEST_BASE64"
 ```
 
-The first run prints a sign-in URL and opens it in your browser (pass
-`--no-browser` to only print it). After you sign in with GitHub, the browser is
-redirected to a temporary listener the CLI opened on `127.0.0.1`, and the
-command continues. The browser therefore has to run on the same machine as the
-CLI.
+The first run prints a sign-in URL and a verification code, and opens the URL
+in your browser (pass `--no-browser` to only print it). The signer shows a
+confirmation page with the same code; check that it matches your terminal and
+press the button. After you sign in with GitHub, the browser is redirected to a
+temporary listener the CLI opened on `127.0.0.1`, and the command continues.
+The browser therefore has to run on the same machine as the CLI, and it must
+accept cookies from the signer.
+
+Never press the button on a sign-in page you reached through a link someone
+sent you, or whose code no terminal of yours is showing: that sign-in belongs
+to whoever built the link.
 
 How it works:
 
 - The signer is a small OAuth 2.0 authorization server for the CLI. The CLI
   runs the authorization code flow with PKCE against it, using a loopback
   redirect URI ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252)).
-- The signer sends the browser on to GitHub, exchanges GitHub's code itself
+- A sign-in URL proves nothing about who built it, and GitHub does not ask
+  again once the OAuth App is authorized. The signer therefore starts nothing
+  until you confirm on its own page, accepts that confirmation only from the
+  page it served to your browser, and completes GitHub's redirect only in the
+  browser that confirmed. A link prepared by someone else, whether to the
+  signer or straight to GitHub, does not sign anyone in by being opened.
+- The signer then sends the browser on to GitHub, exchanges GitHub's code itself
   with the client secret, checks that the account is a configured identity
   with two-factor authentication enabled, and revokes the GitHub token again.
   GitHub credentials never reach the CLI.
@@ -318,7 +330,8 @@ no-op; importing a different key under an existing ID is refused.
 ```text
 GET  /healthz
 GET  /version
-GET  /v1/auth/authorize          OAuth 2.0 authorization endpoint (redirects to GitHub)
+GET  /v1/auth/authorize          OAuth 2.0 authorization endpoint (confirmation page)
+POST /v1/auth/authorize          The confirmation page's form (redirects to GitHub)
 GET  /v1/auth/github/callback    GitHub redirects the browser back here
 POST /v1/auth/token              OAuth 2.0 token endpoint (authorization_code, refresh_token)
 POST /v1/auth/revoke             OAuth 2.0 token revocation

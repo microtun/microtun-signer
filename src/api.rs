@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -11,14 +11,16 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
         header::{
-            CACHE_CONTROL, CONTENT_TYPE, LOCATION, PRAGMA, REFERRER_POLICY, RETRY_AFTER,
-            WWW_AUTHENTICATE,
+            CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, LOCATION, ORIGIN, PRAGMA,
+            REFERRER_POLICY, RETRY_AFTER, SET_COOKIE, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
+            X_FRAME_OPTIONS,
         },
     },
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::Semaphore;
 use tower_governor::{
     GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
@@ -32,13 +34,17 @@ use crate::{
     key::{
         KeyStore, KeyringMemberOutcome, KeyringUnlockError, SignError, UnlockError, UnlockOutcome,
     },
-    oauth::{Account, AuthorizationRequest, CLI_CLIENT_ID, GrantError},
+    oauth::{
+        Account, AuthorizationRequest, CLI_CLIENT_ID, GrantError, new_browser_token, same_token,
+        valid_browser_token, verification_code,
+    },
 };
 use zeroize::Zeroizing;
 
 /// Rate limit on the browser-facing login endpoints, per client address: a
 /// burst of this many requests, replenished one at a time. A login passes
-/// through two of them (authorize, then the GitHub callback).
+/// through three of them (the confirmation page, its form, then the GitHub
+/// callback).
 const LOGIN_BURST: u32 = 30;
 const LOGIN_REPLENISH_INTERVAL: Duration = Duration::from_secs(2);
 /// GitHub callbacks handled at once; each one makes the signer call GitHub.
@@ -236,11 +242,164 @@ pub struct AuthorizeParams {
     code_challenge_method: Option<String>,
 }
 
+/// The cookie that identifies one browser for the length of a sign-in. It
+/// does two jobs: its value is repeated in the confirmation form, so a form
+/// that was not served to this browser is refused (CSRF), and its digest is
+/// stored with the pending login, so GitHub's redirect is only honoured in
+/// the browser that confirmed (a GitHub link prepared elsewhere is useless).
+///
+/// The `__Host-` prefix makes browsers refuse the cookie unless it is Secure,
+/// host-only and has `Path=/`, so no sibling subdomain can plant one. It is
+/// not available on the plain-HTTP loopback URL used for local development.
+const LOGIN_COOKIE_SECURE: &str = "__Host-mts-login";
+const LOGIN_COOKIE_INSECURE: &str = "mts-login";
+/// Matches how long the signer remembers an unfinished sign-in.
+const LOGIN_COOKIE_MAX_AGE_SECONDS: u64 = 10 * 60;
+
+fn login_cookie_name(auth: &Authenticator) -> &'static str {
+    if auth.public_url_is_https() {
+        LOGIN_COOKIE_SECURE
+    } else {
+        LOGIN_COOKIE_INSECURE
+    }
+}
+
+/// The well-formed login cookie this browser sent, if any.
+fn login_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(cookie, _)| *cookie == name)
+        .map(|(_, value)| value.to_owned())
+        .filter(|value| valid_browser_token(value))
+}
+
+/// `SameSite=Lax` and not `Strict`: the cookie has to come back on the
+/// top-level navigation from github.com to the callback.
+fn set_login_cookie(auth: &Authenticator, value: &str) -> Option<HeaderValue> {
+    let secure = if auth.public_url_is_https() {
+        "; Secure"
+    } else {
+        ""
+    };
+    HeaderValue::from_str(&format!(
+        "{}={value}; Path=/; Max-Age={LOGIN_COOKIE_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax{secure}",
+        login_cookie_name(auth)
+    ))
+    .ok()
+}
+
+const CONFIRMATION_PAGE_STYLE: &str = "\
+:root{color-scheme:light dark}\
+body{margin:0;font:16px/1.5 system-ui,sans-serif}\
+main{max-width:34rem;margin:0 auto;padding:3rem 1.25rem}\
+h1{font-size:1.4rem;margin:0 0 1rem}\
+.code{font:600 2rem/1.2 ui-monospace,monospace;letter-spacing:.12em;\
+padding:1rem;margin:1.5rem 0;text-align:center;border:2px solid;border-radius:.5rem}\
+.warn{font-weight:600}\
+button{font:inherit;font-weight:600;padding:.7rem 1.4rem;margin-top:1rem;cursor:pointer}\
+small{display:block;margin-top:2rem;opacity:.75}";
+
+/// The confirmation page may load nothing and run nothing: only its own
+/// style block, identified by hash. `frame-ancestors 'none'` keeps the button
+/// from being clicked through an invisible frame on another site.
+///
+/// There is deliberately no `form-action` directive. Browsers also apply it
+/// to the redirect that answers the form, which would block the hop to GitHub.
+static CONFIRMATION_PAGE_CSP: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "default-src 'none'; style-src 'sha256-{}'; frame-ancestors 'none'; base-uri 'none'",
+        BASE64.encode(Sha256::digest(CONFIRMATION_PAGE_STYLE.as_bytes()))
+    )
+});
+
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// The page a browser gets at the authorization endpoint. Everything taken
+/// from the request is HTML-escaped; nothing else from the query is shown.
+fn confirmation_page(auth: &Authenticator, request: &AuthorizationRequest, csrf: &str) -> String {
+    // Validation guarantees a loopback literal with an explicit port.
+    let listener = reqwest::Url::parse(&request.redirect_uri)
+        .ok()
+        .and_then(|url| Some(format!("{}:{}", url.host_str()?, url.port()?)))
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Sign in to microtun-signer</title>
+<style>{style}</style>
+</head>
+<body>
+<main>
+<h1>Sign in to microtun-signer</h1>
+<p>A <code>microtun-signer</code> command is asking to sign in with your GitHub account. Its terminal shows a verification code. Check that it is this one:</p>
+<p class="code">{code}</p>
+<p class="warn">Continue only if you started that command yourself and the codes match.</p>
+<p>If you got here from a link someone sent you, or no terminal of yours shows this code, close this page. Continuing would let whoever sent the link sign firmware as you.</p>
+<form method="post" action="{action}">
+<input type="hidden" name="redirect_uri" value="{redirect_uri}">
+<input type="hidden" name="state" value="{state}">
+<input type="hidden" name="code_challenge" value="{code_challenge}">
+<input type="hidden" name="csrf" value="{csrf}">
+<button type="submit">The codes match &ndash; continue to GitHub</button>
+</form>
+<small>After GitHub, the result is delivered to the command listening on {listener} on this computer.</small>
+</main>
+</body>
+</html>
+"#,
+        style = CONFIRMATION_PAGE_STYLE,
+        code = html_escape(&verification_code(&request.code_challenge)),
+        action = html_escape(auth.authorize_endpoint()),
+        redirect_uri = html_escape(&request.redirect_uri),
+        state = html_escape(&request.state),
+        code_challenge = html_escape(&request.code_challenge),
+        csrf = html_escape(csrf),
+        listener = html_escape(&listener),
+    )
+}
+
+/// A plain-text answer for a person looking at a browser tab.
+fn login_refused(status: StatusCode, message: &'static str) -> Response {
+    let mut response = no_store((status, message));
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
 /// OAuth 2.0 authorization endpoint for the signer CLI (authorization code
-/// flow with PKCE, loopback redirect). The signer has no login page of its
-/// own: it remembers the request and sends the browser on to GitHub.
+/// flow with PKCE, loopback redirect).
+///
+/// A request here proves nothing about who built it: the CLI is a public
+/// client, and anyone can put their own PKCE challenge and loopback port into
+/// such a URL and send it to a maintainer. GitHub does not ask again once the
+/// OAuth App is authorized, so the signer must not pass the browser straight
+/// on. It shows a confirmation page instead, and nothing is remembered and
+/// GitHub is not involved until the person presses the button on it.
 pub async fn oauth_authorize(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Result<Response, ApiError> {
     let request_id = Ulid::new().to_string();
@@ -269,16 +428,105 @@ pub async fn oauth_authorize(
     )
     .map_err(|_| invalid())?;
 
-    let github_url = state.auth.begin_github_login(request).map_err(|_| {
+    // Keep the cookie a browser already has, so that a second sign-in tab
+    // does not invalidate the form in the first one.
+    let browser_token =
+        login_cookie(&headers, login_cookie_name(&state.auth)).unwrap_or_else(new_browser_token);
+    let cookie = set_login_cookie(&state.auth, &browser_token).ok_or_else(|| {
         ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal-error",
+            "Internal error",
+            "The sign-in cookie could not be created.",
+            &request_id,
+        )
+    })?;
+
+    let page = confirmation_page(&state.auth, &request, &browser_token);
+    let mut response = no_store(([(CONTENT_TYPE, "text/html; charset=utf-8")], page));
+    let response_headers = response.headers_mut();
+    response_headers.insert(SET_COOKIE, cookie);
+    if let Ok(policy) = HeaderValue::from_str(&CONFIRMATION_PAGE_CSP) {
+        response_headers.insert(CONTENT_SECURITY_POLICY, policy);
+    }
+    response_headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response_headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    // Not `no-referrer`: under that policy browsers submit the form with
+    // `Origin: null`, and the form handler below could not tell where it came
+    // from. `same-origin` still keeps this URL away from GitHub.
+    response_headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+pub struct AuthorizeConfirmation {
+    redirect_uri: String,
+    state: String,
+    code_challenge: String,
+    csrf: String,
+}
+
+/// The confirmation page's form: the person pressed the button. Only now is
+/// the sign-in remembered and the browser sent on to GitHub.
+///
+/// The request must demonstrably come from the page this signer served to
+/// this browser: the `Origin` header has to be the signer's own, and the
+/// form has to repeat the value of the login cookie, which no other site can
+/// read or set.
+pub async fn oauth_authorize_confirm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<AuthorizeConfirmation>, FormRejection>,
+) -> Response {
+    let request_id = Ulid::new().to_string();
+    let Ok(Form(form)) = form else {
+        return login_refused(
+            StatusCode::BAD_REQUEST,
+            "This sign-in form is incomplete. Run the microtun-signer command again.\n",
+        );
+    };
+
+    let same_origin = headers
+        .get(ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+        .is_some_and(|origin| origin == state.auth.public_origin());
+    let confirmed_here = login_cookie(&headers, login_cookie_name(&state.auth))
+        .filter(|cookie| same_token(cookie, &form.csrf));
+    let (true, Some(browser_token)) = (same_origin, confirmed_here) else {
+        audit_login(
+            &request_id,
+            "oauth-login-confirm",
+            false,
+            "confirmation did not come from the signer's own page in this browser",
+            None,
+        );
+        return login_refused(
+            StatusCode::FORBIDDEN,
+            "This sign-in could not be confirmed: the request did not come from the signer's own page in this browser. Run the microtun-signer command again and open the link it prints. Cookies must be enabled for this site.\n",
+        );
+    };
+
+    let Ok(request) =
+        AuthorizationRequest::new(&form.redirect_uri, &form.state, &form.code_challenge)
+    else {
+        return login_refused(
+            StatusCode::BAD_REQUEST,
+            "This sign-in form is invalid. Run the microtun-signer command again.\n",
+        );
+    };
+
+    match state.auth.begin_github_login(request, &browser_token) {
+        // 303 turns the browser's POST into a GET of the GitHub URL.
+        Ok(github_url) => browser_redirect(StatusCode::SEE_OTHER, &github_url),
+        Err(_) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "oauth-capacity-exhausted",
             "GitHub sign-in is temporarily unavailable",
             "The signer is tracking too many unfinished sign-ins.",
             &request_id,
         )
-    })?;
-    Ok(browser_redirect(&github_url))
+        .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,11 +536,13 @@ pub struct GithubCallbackParams {
     error: Option<String>,
 }
 
-/// Where GitHub sends the browser back to. The signer exchanges GitHub's code
-/// itself, checks the account, and then redirects the browser to the CLI's
-/// loopback listener with a signer authorization code (or an OAuth error).
+/// Where GitHub sends the browser back to. If this is the browser that
+/// confirmed the sign-in, the signer exchanges GitHub's code itself, checks
+/// the account, and then redirects the browser to the CLI's loopback listener
+/// with a signer authorization code (or an OAuth error).
 pub async fn github_oauth_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<GithubCallbackParams>,
 ) -> Response {
     let request_id = Ulid::new().to_string();
@@ -320,6 +570,27 @@ pub async fn github_oauth_callback(
         ));
     };
 
+    // The sign-in is finished only in the browser that confirmed it. Someone
+    // who confirmed in their own browser and passed the resulting GitHub link
+    // on gets nothing: the code is not exchanged and nothing is sent to the
+    // loopback port they chose. The pending login is already consumed.
+    let same_browser = login_cookie(&headers, login_cookie_name(&state.auth))
+        .is_some_and(|cookie| pending.confirmed_by(&cookie));
+    if !same_browser {
+        audit_login(
+            &request_id,
+            "oauth-login",
+            false,
+            "GitHub redirect arrived in a browser that did not confirm the sign-in",
+            None,
+        );
+        return login_refused(
+            StatusCode::FORBIDDEN,
+            "This sign-in was not started in this browser, so it was cancelled. If you followed a link someone sent you, do not retry it. Otherwise run the microtun-signer command again and finish in the browser that opened its link.
+",
+        );
+    }
+
     let outcome = match params.code.as_deref() {
         Some(code) if params.error.is_none() => {
             state.auth.finish_github_login(&pending, code).await
@@ -345,7 +616,7 @@ pub async fn github_oauth_callback(
     redirect
         .query_pairs_mut()
         .append_pair("state", &pending.request.state);
-    browser_redirect(&redirect)
+    browser_redirect(StatusCode::FOUND, &redirect)
 }
 
 #[derive(Deserialize)]
@@ -514,11 +785,11 @@ pub async fn oauth_revoke(
 
 /// Redirect a browser. The URL carries one-time credentials in its query, so
 /// keep it out of caches and out of any Referer header.
-fn browser_redirect(location: &reqwest::Url) -> Response {
+fn browser_redirect(status: StatusCode, location: &reqwest::Url) -> Response {
     let Ok(location) = HeaderValue::from_str(location.as_str()) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let mut response = no_store(StatusCode::FOUND);
+    let mut response = no_store(status);
     let headers = response.headers_mut();
     headers.insert(LOCATION, location);
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -1453,6 +1724,76 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::auth::{AuthSource, GithubAccountIdentity, GithubActionsIdentity};
+
+    #[test]
+    fn confirmation_page_escapes_everything_taken_from_the_request() {
+        let auth = Authenticator::for_tests();
+        let state = r#""><script>alert(1)</script>&'"#;
+        let request = AuthorizationRequest::new(
+            "http://127.0.0.1:4000/callback",
+            state,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        )
+        .unwrap();
+        let page = confirmation_page(&auth, &request, "csrf-token");
+        assert!(!page.contains("<script>"), "{page}");
+        assert!(page.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;&#39;"));
+        assert!(page.contains(&verification_code(&request.code_challenge)));
+        assert!(page.contains("127.0.0.1:4000"));
+        assert!(
+            page.contains(r#"action="https://signer.example.com/v1/auth/authorize""#),
+            "{page}"
+        );
+        // The style block is the one the Content-Security-Policy allows.
+        assert!(page.contains(&format!("<style>{CONFIRMATION_PAGE_STYLE}</style>")));
+        assert!(CONFIRMATION_PAGE_CSP.contains("frame-ancestors 'none'"));
+        assert!(!CONFIRMATION_PAGE_CSP.contains("form-action"));
+    }
+
+    #[test]
+    fn login_cookie_is_found_among_others_and_validated() {
+        let token = new_browser_token();
+        let mut headers = HeaderMap::new();
+        assert_eq!(login_cookie(&headers, LOGIN_COOKIE_SECURE), None);
+        headers.insert(
+            COOKIE,
+            format!("theme=dark; {LOGIN_COOKIE_SECURE}={token}; other=1")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(login_cookie(&headers, LOGIN_COOKIE_SECURE), Some(token));
+        // The development name is a different cookie.
+        assert_eq!(login_cookie(&headers, LOGIN_COOKIE_INSECURE), None);
+
+        headers.insert(
+            COOKIE,
+            format!("{LOGIN_COOKIE_SECURE}=not-a-token")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(login_cookie(&headers, LOGIN_COOKIE_SECURE), None);
+    }
+
+    #[test]
+    fn login_cookie_attributes_follow_the_public_url_scheme() {
+        let token = new_browser_token();
+        let https = set_login_cookie(&Authenticator::for_tests(), &token).unwrap();
+        let https = https.to_str().unwrap();
+        assert!(https.starts_with(&format!("__Host-mts-login={token}; Path=/;")));
+        for attribute in ["HttpOnly", "SameSite=Lax", "Secure", "Max-Age=600"] {
+            assert!(https.contains(attribute), "{https}");
+        }
+
+        let local = Authenticator::for_tests_with_github(
+            "https://api.github.com",
+            "http://127.0.0.1:8080",
+            Vec::new(),
+        );
+        let http = set_login_cookie(&local, &token).unwrap();
+        let http = http.to_str().unwrap();
+        assert!(http.starts_with(&format!("mts-login={token}; ")), "{http}");
+        assert!(!http.contains("Secure"), "{http}");
+    }
 
     #[tokio::test]
     async fn version_reports_package_version() {

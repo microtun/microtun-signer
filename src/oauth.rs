@@ -92,7 +92,19 @@ pub struct PendingLogin {
     pub request: AuthorizationRequest,
     /// PKCE verifier for the signer's own code exchange with GitHub.
     pub github_code_verifier: String,
+    /// Digest of the login cookie of the browser that confirmed this sign-in
+    /// on the signer's own page. GitHub's redirect is only honoured when it
+    /// comes back through that same browser.
+    browser: TokenKey,
     expires_at: Instant,
+}
+
+impl PendingLogin {
+    /// Whether `browser_token` is the login cookie this sign-in was confirmed
+    /// with.
+    pub fn confirmed_by(&self, browser_token: &str) -> bool {
+        self.browser == token_key(browser_token)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -168,11 +180,13 @@ impl OAuthStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Remember an authorization request and return the `state` value to send
+    /// Remember an authorization request that the user confirmed in the
+    /// browser holding `browser_token`, and return the `state` value to send
     /// to GitHub together with the PKCE challenge for that leg.
     pub fn begin_login(
         &self,
         request: AuthorizationRequest,
+        browser_token: &str,
     ) -> Result<(String, String), CapacityError> {
         let now = Instant::now();
         let mut inner = self.lock();
@@ -188,6 +202,7 @@ impl OAuthStore {
             PendingLogin {
                 request,
                 github_code_verifier,
+                browser: token_key(browser_token),
                 expires_at: now + PENDING_LOGIN_TTL,
             },
         );
@@ -420,6 +435,45 @@ fn valid_code_verifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
+/// The short code that ties the signer's confirmation page to one CLI
+/// invocation. Both sides derive it from the PKCE challenge: the CLI prints
+/// it, the page displays it, and the user continues only if they match.
+/// Someone who was merely sent a sign-in link has no terminal showing it.
+///
+/// Eight characters from an alphabet without look-alikes (no I, O, 0, 1),
+/// formatted as `ABCD-EFGH`.
+pub fn verification_code(code_challenge: &str) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let digest = Sha256::new()
+        .chain_update(b"microtun-signer sign-in verification code\0")
+        .chain_update(code_challenge.as_bytes())
+        .finalize();
+    let mut code = String::with_capacity(9);
+    for (position, byte) in digest.iter().take(8).enumerate() {
+        if position == 4 {
+            code.push('-');
+        }
+        // 256 is a multiple of 32, so every character is equally likely.
+        code.push(char::from(ALPHABET[usize::from(byte % 32)]));
+    }
+    code
+}
+
+/// A fresh value for the browser's login cookie.
+pub fn new_browser_token() -> String {
+    B64URL.encode(random_bytes::<32>())
+}
+
+/// Shape check for a login cookie value before it is hashed or echoed.
+pub fn valid_browser_token(value: &str) -> bool {
+    value.len() == 43 && value.bytes().all(is_base64url_byte)
+}
+
+/// Compare two secrets without an early exit on the first differing byte.
+pub fn same_token(left: &str, right: &str) -> bool {
+    token_key(left) == token_key(right)
+}
+
 fn s256(code_verifier: &str) -> String {
     B64URL.encode(Sha256::digest(code_verifier.as_bytes()))
 }
@@ -522,12 +576,42 @@ mod tests {
     #[test]
     fn pending_logins_are_single_use() {
         let store = store();
-        let (state, github_challenge) = store.begin_login(request()).unwrap();
+        let browser = new_browser_token();
+        let (state, github_challenge) = store.begin_login(request(), &browser).unwrap();
         let pending = store.take_pending_login(&state).unwrap();
         assert_eq!(pending.request, request());
+        assert!(pending.confirmed_by(&browser));
+        assert!(!pending.confirmed_by(&new_browser_token()));
+        assert!(!pending.confirmed_by(""));
         assert_eq!(s256(&pending.github_code_verifier), github_challenge);
         assert!(store.take_pending_login(&state).is_none());
         assert!(store.take_pending_login("unknown").is_none());
+    }
+
+    #[test]
+    fn verification_code_is_stable_readable_and_challenge_specific() {
+        let code = verification_code(&s256(VERIFIER));
+        assert_eq!(code, verification_code(&s256(VERIFIER)));
+        assert_eq!(code.len(), 9);
+        assert_eq!(code.as_bytes()[4], b'-');
+        assert!(
+            code.bytes()
+                .all(|byte| byte == b'-' || b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&byte)),
+            "{code}"
+        );
+        assert_ne!(code, verification_code(&s256(&"x".repeat(43))));
+    }
+
+    #[test]
+    fn browser_tokens_are_validated_by_shape() {
+        let token = new_browser_token();
+        assert!(valid_browser_token(&token));
+        assert_ne!(token, new_browser_token());
+        assert!(!valid_browser_token(""));
+        assert!(!valid_browser_token(&"a".repeat(42)));
+        assert!(!valid_browser_token(&"=".repeat(43)));
+        assert!(same_token(&token, &token));
+        assert!(!same_token(&token, &new_browser_token()));
     }
 
     #[test]

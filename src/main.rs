@@ -36,10 +36,10 @@ use zeroize::Zeroizing;
 use crate::{
     api::{
         AdminState, AppState, KeyringUnlockResponse, create_signature, get_public_key,
-        github_oauth_callback, health, oauth_authorize, oauth_revoke, oauth_token,
-        rate_limit_logins, unlock_key, unlock_keyring, version,
+        github_oauth_callback, health, oauth_authorize, oauth_authorize_confirm, oauth_revoke,
+        oauth_token, rate_limit_logins, unlock_key, unlock_keyring, version,
     },
-    auth::{Authenticator, GITHUB_CALLBACK_PATH},
+    auth::{AUTHORIZE_PATH, Authenticator, GITHUB_CALLBACK_PATH},
     authorization::Authorizer,
     config::{Config, DEFAULT_ADMIN_SOCKET_PATH, valid_keyring_name},
     key::KeyStore,
@@ -257,11 +257,14 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
 /// The public API. `/v1/auth/*` is a small OAuth 2.0 authorization server for
 /// the CLI that delegates the actual user authentication to GitHub.
 fn public_router(state: AppState, client_ip_header: Option<HeaderName>) -> Router {
-    // The two routes a browser passes through during a login are the only
+    // The routes a browser passes through during a login are the only
     // unauthenticated ones that make the signer hold state or call GitHub.
     let login_routes = rate_limit_logins(
         Router::new()
-            .route("/v1/auth/authorize", get(oauth_authorize))
+            .route(
+                AUTHORIZE_PATH,
+                get(oauth_authorize).post(oauth_authorize_confirm),
+            )
             .route(GITHUB_CALLBACK_PATH, get(github_oauth_callback)),
         client_ip_header,
     );

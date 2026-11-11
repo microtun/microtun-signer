@@ -178,3 +178,119 @@ async fn revoke(State(state): State<MockGithub>) -> Response {
     state.revocations.fetch_add(1, Ordering::SeqCst);
     state.revoke_status.into_response()
 }
+
+/// What a browser keeps from the signer's confirmation page.
+pub struct ConfirmationPage {
+    /// `name=value` of the login cookie the page set.
+    pub cookie: String,
+    pub action: String,
+    pub fields: Vec<(String, String)>,
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let start = tag.find(&format!("{name}=\""))? + name.len() + 2;
+    let end = start + tag[start..].find('"')?;
+    Some(html_unescape(&tag[start..end]))
+}
+
+/// A client that, like a browser being observed step by step, follows no
+/// redirect on its own.
+pub fn browser_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+/// Open the signer's authorization URL and read the confirmation page.
+pub async fn open_confirmation_page(authorize_url: &reqwest::Url) -> ConfirmationPage {
+    let response = browser_client()
+        .get(authorize_url.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let html = response.text().await.unwrap();
+    let form = &html[html.find("<form ").expect("the page has a form")..];
+    let action = attribute(form, "action").unwrap();
+    let fields = form
+        .split("<input ")
+        .skip(1)
+        .map(|input| {
+            (
+                attribute(input, "name").unwrap(),
+                attribute(input, "value").unwrap(),
+            )
+        })
+        .collect();
+    ConfirmationPage {
+        cookie,
+        action,
+        fields,
+    }
+}
+
+/// Press the button on the confirmation page. `cookie` and `origin` are what
+/// the browser would send along; tests leave them out or change them to play
+/// a request that did not come from the signer's own page.
+pub async fn submit_confirmation(
+    page: &ConfirmationPage,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+) -> reqwest::Response {
+    let mut request = browser_client().post(&page.action).form(&page.fields);
+    if let Some(cookie) = cookie {
+        request = request.header("cookie", cookie);
+    }
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    request.send().await.unwrap()
+}
+
+/// Follow redirects from `response` to the end, sending `cookie` only to the
+/// signer (`signer_origin`), as a browser's cookie jar would.
+pub async fn follow_redirects(
+    mut response: reqwest::Response,
+    signer_origin: &str,
+    cookie: Option<&str>,
+) -> reqwest::Response {
+    while response.status().is_redirection() {
+        let location = reqwest::Url::parse(response.headers()[LOCATION].to_str().unwrap()).unwrap();
+        let mut request = browser_client().get(location.clone());
+        if let Some(cookie) = cookie
+            && location.origin().ascii_serialization() == signer_origin
+        {
+            request = request.header("cookie", cookie);
+        }
+        response = request.send().await.unwrap();
+    }
+    response
+}
+
+/// Stands in for a person at a browser: opens the confirmation page, presses
+/// the button, and follows signer -> GitHub -> signer -> CLI loopback
+/// listener. Returns the last page.
+pub async fn browser_sign_in(authorize_url: &reqwest::Url) -> reqwest::Response {
+    let origin = authorize_url.origin().ascii_serialization();
+    let page = open_confirmation_page(authorize_url).await;
+    let submitted = submit_confirmation(&page, Some(&page.cookie), Some(&origin)).await;
+    assert_eq!(submitted.status(), StatusCode::SEE_OTHER);
+    follow_redirects(submitted, &origin, Some(&page.cookie)).await
+}
