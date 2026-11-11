@@ -252,11 +252,70 @@ pub struct KeyMaterial {
     unlocked: RwLock<Option<UnlockedKeyMaterial>>,
 }
 
+/// A decrypted private key, ready to sign. Shared by the service (a key that
+/// an operator has unlocked) and by the CLI's local development key store, so
+/// both produce byte-for-byte the same signature and public-key encodings.
 #[allow(clippy::large_enum_variant)]
-enum UnlockedKeyMaterial {
+pub(crate) enum UnlockedKeyMaterial {
     P256(P256SigningKey),
     Secp256k1(Secp256k1SigningKey),
     RsaPss(RsaPssSigningKey<Sha256>),
+}
+
+impl UnlockedKeyMaterial {
+    pub(crate) const fn algorithm(&self) -> KeyAlgorithm {
+        match self {
+            Self::P256(_) => KeyAlgorithm::P256,
+            Self::Secp256k1(_) => KeyAlgorithm::Secp256k1,
+            Self::RsaPss(_) => KeyAlgorithm::RsaPss,
+        }
+    }
+
+    /// PEM-encoded SubjectPublicKeyInfo, always newline-terminated.
+    pub(crate) fn public_key_pem(&self) -> Option<String> {
+        let mut pem = match self {
+            Self::P256(signing_key) => signing_key
+                .verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .ok()?,
+            Self::Secp256k1(signing_key) => signing_key
+                .verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .ok()?,
+            Self::RsaPss(signing_key) => RsaPublicKey::from(signing_key.as_ref())
+                .to_public_key_pem(LineEnding::LF)
+                .ok()?,
+        };
+        if !pem.ends_with('\n') {
+            pem.push('\n');
+        }
+        Some(pem)
+    }
+
+    /// Sign a SHA-256 digest as a prehash. ECDSA signatures are the
+    /// fixed-width `r || s` encoding; RSA-PSS uses a 32-byte salt.
+    pub(crate) fn sign_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>, SignError> {
+        match self {
+            Self::P256(signing_key) => {
+                let signature: P256Signature = signing_key
+                    .sign_prehash(digest)
+                    .map_err(|_| SignError::Failed)?;
+                Ok(signature.to_bytes().to_vec())
+            }
+            Self::Secp256k1(signing_key) => {
+                let signature: Secp256k1Signature = signing_key
+                    .sign_prehash(digest)
+                    .map_err(|_| SignError::Failed)?;
+                Ok(signature.to_bytes().to_vec())
+            }
+            Self::RsaPss(signing_key) => {
+                let signature: RsaPssSignature = signing_key
+                    .sign_prehash_with_rng(&mut OsRng, digest)
+                    .map_err(|_| SignError::Failed)?;
+                Ok(signature.to_vec())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,24 +416,7 @@ impl KeyMaterial {
 
     pub fn public_key_pem(&self) -> Option<String> {
         let guard = self.unlocked.read().ok()?;
-        let key = guard.as_ref()?;
-        let mut pem = match key {
-            UnlockedKeyMaterial::P256(signing_key) => signing_key
-                .verifying_key()
-                .to_public_key_pem(LineEnding::LF)
-                .ok()?,
-            UnlockedKeyMaterial::Secp256k1(signing_key) => signing_key
-                .verifying_key()
-                .to_public_key_pem(LineEnding::LF)
-                .ok()?,
-            UnlockedKeyMaterial::RsaPss(signing_key) => RsaPublicKey::from(signing_key.as_ref())
-                .to_public_key_pem(LineEnding::LF)
-                .ok()?,
-        };
-        if !pem.ends_with('\n') {
-            pem.push('\n');
-        }
-        Some(pem)
+        guard.as_ref()?.public_key_pem()
     }
 
     pub fn unlock(&self, passphrase: &str) -> Result<UnlockOutcome, UnlockError> {
@@ -428,27 +470,7 @@ impl KeyMaterial {
 
     pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>, SignError> {
         let guard = self.unlocked.read().map_err(|_| SignError::Failed)?;
-        let key = guard.as_ref().ok_or(SignError::Locked)?;
-        match key {
-            UnlockedKeyMaterial::P256(signing_key) => {
-                let signature: P256Signature = signing_key
-                    .sign_prehash(digest)
-                    .map_err(|_| SignError::Failed)?;
-                Ok(signature.to_bytes().to_vec())
-            }
-            UnlockedKeyMaterial::Secp256k1(signing_key) => {
-                let signature: Secp256k1Signature = signing_key
-                    .sign_prehash(digest)
-                    .map_err(|_| SignError::Failed)?;
-                Ok(signature.to_bytes().to_vec())
-            }
-            UnlockedKeyMaterial::RsaPss(signing_key) => {
-                let signature: RsaPssSignature = signing_key
-                    .sign_prehash_with_rng(&mut OsRng, digest)
-                    .map_err(|_| SignError::Failed)?;
-                Ok(signature.to_vec())
-            }
-        }
+        guard.as_ref().ok_or(SignError::Locked)?.sign_digest(digest)
     }
 }
 

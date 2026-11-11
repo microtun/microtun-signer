@@ -28,7 +28,7 @@ use crate::{
 pub struct SignArgs {
     /// Immutable signing key ID to use.
     #[arg(short = 'k', long = "key-id", env = "MICROTUN_SIGNER_KEY_ID")]
-    key_id: String,
+    pub(crate) key_id: String,
 
     /// Bearer credential accepted by the signer. Prefer MICROTUN_SIGNER_TOKEN
     /// over --token so the credential is not exposed in the process list.
@@ -61,14 +61,14 @@ pub struct SignArgs {
 
     /// 32-byte SHA-256 firmware digest encoded as base64.
     #[arg(short = 'd', long, env = "MICROTUN_SIGNER_DIGEST")]
-    digest: String,
+    pub(crate) digest: String,
 }
 
 #[derive(Debug, Args)]
 pub struct PublicKeyArgs {
     /// Immutable signing key ID to fetch.
     #[arg(short = 'k', long = "key-id", env = "MICROTUN_SIGNER_KEY_ID")]
-    key_id: String,
+    pub(crate) key_id: String,
 }
 
 #[derive(Serialize)]

@@ -1,9 +1,17 @@
-microtun-signer (0.12.0) UNRELEASED; urgency=medium
+microtun-signer (0.13.0) UNRELEASED; urgency=medium
+
+  * Add local development keys: sign and public-key accept --url local: and
+    use unencrypted keys managed with the new local subcommand, without a
+    signer service.
+
+ -- Damian Peckett <damian@pecke.tt>  Wed, 11 Nov 2026 10:25:37 +0100
+
+microtun-signer (0.12.0) unstable; urgency=medium
 
   * Replace the GitHub device flow with the OAuth authorization code flow
     (PKCE, loopback redirect). 
 
- -- Damian Peckett <damian@pecke.tt>  Tue, 10 Nov 2026 23:12:16 +0100
+ -- Damian Peckett <damian@pecke.tt>  Wed, 11 Nov 2026 10:25:29 +0100
 
 microtun-signer (0.11.0) unstable; urgency=medium
 

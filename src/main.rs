@@ -4,6 +4,7 @@ mod authorization;
 mod client;
 mod config;
 mod key;
+mod local;
 mod oauth;
 mod session_cache;
 #[cfg(test)]
@@ -55,7 +56,9 @@ struct Cli {
     #[arg(short = 'c', long, env = "MICROTUN_SIGNER_CONFIG", global = true)]
     config: Option<PathBuf>,
 
-    /// Base URL of the public Microtun signer API.
+    /// Base URL of the public Microtun signer API, or `local:` (optionally
+    /// `local:/absolute/dir`) to sign on this machine with a development key
+    /// created by `microtun-signer local init`.
     #[arg(short = 'u', long, env = "MICROTUN_SIGNER_URL", global = true)]
     url: Option<String>,
 
@@ -79,6 +82,9 @@ enum Commands {
 
     /// End the cached GitHub user session for a signer and forget it locally.
     Logout,
+
+    /// Manage unencrypted development keys for `--url local:` signing.
+    Local(local::LocalArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -133,16 +139,29 @@ async fn main() -> Result<()> {
         Commands::Unlock(args) => unlock(args, config.as_deref()).await,
         Commands::Sign(args) => {
             let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
-            client::sign(&url, args).await
+            if local::is_local_url(&url) {
+                // Credentials (--token, --github-login, ...) do not apply.
+                local::sign(&url, &args)
+            } else {
+                client::sign(&url, args).await
+            }
         }
         Commands::PublicKey(args) => {
             let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
-            client::public_key(&url, args).await
+            if local::is_local_url(&url) {
+                local::public_key(&url, &args)
+            } else {
+                client::public_key(&url, args).await
+            }
         }
         Commands::Logout => {
             let url = url.context("--url is required unless MICROTUN_SIGNER_URL is set")?;
+            if local::is_local_url(&url) {
+                bail!("local signing has no session to end");
+            }
             client::logout(&url).await
         }
+        Commands::Local(args) => local::run(args, url.as_deref()),
     }
 }
 

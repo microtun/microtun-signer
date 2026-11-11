@@ -7,6 +7,7 @@ It supports:
 - GitHub users via the OAuth authorization code flow (browser sign-in, PKCE, refresh tokens)
 - GitHub Actions via OIDC
 - Signing keys are encrypted at rest and must be unlocked after every restart
+- Local development keys for offline builds and tests (`--url local:`), without a service
 
 ## Supported algorithms
 
@@ -241,6 +242,76 @@ bytes for RSA-3072.
 ```
 
 On success, the command writes the PEM-encoded SubjectPublicKeyInfo public key to stdout. The signing key must be unlocked before its public key is available.
+
+## Local development keys
+
+For development builds and tests that have no reason to reach a signer
+service, `--url local:` makes `sign` and `public-key` work on this machine
+with an unencrypted key file. Nothing listens, nobody signs in, and nothing is
+unlocked; the command lines, the digest input, and the signature and
+public-key output are exactly those of a remote signer, so a build system
+only has to change the URL.
+
+```bash
+# Once per machine and key:
+./target/release/microtun-signer local init \
+  --key-id my-project-p256 --algorithm p256
+
+./target/release/microtun-signer public-key \
+  --url local: --key-id my-project-p256
+
+./target/release/microtun-signer sign \
+  --url local: --key-id my-project-p256 --digest "$DIGEST_BASE64"
+```
+
+`local init` accepts the same algorithms as `[[Key]]` (`p256`/`secp256r1`,
+`secp256k1`, `rsa-pss`; RSA keys are 3072 bits unless `--rsa-bits 2048` or
+`4096` is given). It does nothing if the key already exists, and fails if the
+existing key has a different algorithm or RSA size, so it is safe to run from
+setup scripts and CI.
+
+Do not ship anything signed with a local key, and remember that a device
+provisioned to trust one (for example through eFuses or OTP) depends on that
+key file from then on: back it up like any other key you cannot regenerate.
+
+### Where the keys are
+
+Each key is `<key-id>.pem` (unencrypted PKCS#8, mode `0600`) with a derived
+`<key-id>.pub.pem` beside it, in the first of:
+
+1. `--dir` (the `local` subcommands only),
+2. the directory in the URL: `--url local:/absolute/dir`,
+3. `MICROTUN_SIGNER_LOCAL_DIR` (an absolute path),
+4. `microtun-signer/local` in the user data directory
+   (`$XDG_DATA_HOME` or `~/.local/share` on Linux,
+   `~/Library/Application Support` on macOS).
+
+The default is deliberately outside any source tree, so keys survive
+`git clean` and are shared by all checkouts. Use a `local:/absolute/dir` URL
+for a throwaway store, for example one per CI job or test run. The directory
+is created with mode `0700` and is refused if group or other users can write
+to it; key files are refused if they are readable by anyone but their owner.
+
+```bash
+microtun-signer local list                           # <key-id><TAB><algorithm>
+microtun-signer local path                           # the store directory
+microtun-signer local path --key-id my-project-p256     # that key's .pub.pem file
+```
+
+The `.pub.pem` file is a convenience for build systems that want a file to
+depend on; `public-key` always derives its output from the private key.
+
+### Import an existing development key
+
+```bash
+microtun-signer local import \
+  --key-id my-project-k1 --algorithm secp256k1 --pem old-dev-key.pem
+```
+
+The file must be an unencrypted PEM private key: PKCS#8, or OpenSSL's
+traditional `EC PRIVATE KEY` / `RSA PRIVATE KEY`. It is copied into the store
+as PKCS#8 and the original is left in place. Importing the same key again is a
+no-op; importing a different key under an existing ID is refused.
 
 ## API
 
